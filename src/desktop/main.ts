@@ -42,6 +42,16 @@ import {
 // Must be called before app.whenReady().
 app.commandLine.appendSwitch("js-flags", "--max-old-space-size=8192");
 
+// Apply platform-specific launch mitigations (e.g. disable GPU compositing on
+// Linux --no-sandbox to prevent renderer crashes from canvas teardown/recreate).
+for (const mitigation of getDesktopLaunchMitigations({
+  platform: process.platform,
+  argv: process.argv,
+})) {
+  app.commandLine.appendSwitch(mitigation);
+  console.log(`[startup] Applied launch mitigation: --${mitigation}`);
+}
+
 import * as fs from "fs";
 import * as path from "path";
 import type { Config } from "../node/config";
@@ -59,6 +69,8 @@ import { isBashAvailable } from "../node/utils/main/bashPath";
 import windowStateKeeper from "electron-window-state";
 import { getTitleBarOptions } from "./titleBarOptions";
 import { isUpdateInstallInProgress } from "./updateInstallState";
+import { getDesktopLaunchMitigations } from "./launchPolicy";
+import { createWindowResilienceController } from "./windowResilience";
 import { getErrorMessage } from "@/common/utils/errors";
 
 // React DevTools for development profiling
@@ -890,6 +902,27 @@ function createWindow() {
     // First token count will use approximation, accurate count caches in background.
   });
 
+  // Renderer crash recovery: detect renderer/GPU process loss and auto-reload.
+  // Without this, a crashed renderer shows a permanent white screen with no logging.
+  const resilience = createWindowResilienceController({
+    reload: () => mainWindow?.webContents.reload(),
+    isWindowAlive: () => mainWindow != null && !mainWindow.isDestroyed(),
+    isQuitting: () => isQuitting,
+    log: (level, message) => console[level](message),
+  });
+
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    resilience.requestRecovery(`render-process-gone:${details.reason}:${details.exitCode}`);
+  });
+
+  mainWindow.webContents.on("unresponsive", () => {
+    console.warn("[window] Renderer became unresponsive");
+  });
+
+  mainWindow.webContents.on("did-finish-load", () => {
+    resilience.markLoadSucceeded();
+  });
+
   mainWindow.on("closed", () => {
     mainWindow = null;
     mainWindowFinishedLoading = false;
@@ -996,6 +1029,14 @@ if (gotTheLock) {
     void Promise.race([disposePromise, timeoutPromise]).finally(() => {
       app.quit();
     });
+  });
+
+  app.on("child-process-gone", (_event, details) => {
+    if (details.type === "GPU") {
+      console.error(
+        `[window] GPU process gone: reason=${details.reason}, exitCode=${details.exitCode}`
+      );
+    }
   });
 
   app.on("window-all-closed", () => {
