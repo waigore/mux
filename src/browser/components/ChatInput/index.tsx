@@ -64,7 +64,7 @@ import {
   getSlashCommandSuggestions,
   type SlashSuggestion,
 } from "@/browser/utils/slashCommands/suggestions";
-import { Tooltip, TooltipTrigger, TooltipContent, HelpIndicator } from "../ui/tooltip";
+import { Tooltip, TooltipTrigger, TooltipContent } from "../ui/tooltip";
 import { AgentModePicker } from "../AgentModePicker";
 import { ContextUsageIndicatorButton } from "../ContextUsageIndicatorButton";
 import { useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
@@ -117,11 +117,12 @@ import { CreationCenterContent } from "./CreationCenterContent";
 import { cn } from "@/common/lib/utils";
 import type { ChatInputProps, ChatInputAPI, QueueDispatchMode } from "./types";
 import { CreationControls } from "./CreationControls";
-import { SendModeDropdown } from "./SendModeDropdown";
+import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { CodexOauthWarningBanner } from "./CodexOauthWarningBanner";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
+import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
 import { usePowerMode } from "@/browser/contexts/PowerModeContext";
 import { useVoiceInput } from "@/browser/hooks/useVoiceInput";
 import { VoiceInputButton } from "./VoiceInputButton";
@@ -187,7 +188,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const editingMessage = variant === "workspace" ? props.editingMessage : undefined;
   const isStreamStarting = variant === "workspace" ? (props.isStreamStarting ?? false) : false;
   const isCompacting = variant === "workspace" ? (props.isCompacting ?? false) : false;
-  const canInterrupt = variant === "workspace" ? (props.canInterrupt ?? false) : false;
   const [isMobileTouch, setIsMobileTouch] = useState(
     () =>
       typeof window !== "undefined" &&
@@ -252,6 +252,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // clear the "in flight" state until all sends complete.
   const [sendingCount, setSendingCount] = useState(0);
   const isSending = sendingCount > 0;
+  const sendModeMenuContainerRef = useRef<HTMLDivElement>(null);
   const [hideReviewsDuringSend, setHideReviewsDuringSend] = useState(false);
   const [showAtMentionSuggestions, setShowAtMentionSuggestions] = useState(false);
   const [atMentionSuggestions, setAtMentionSuggestions] = useState<SlashSuggestion[]>([]);
@@ -355,6 +356,46 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Attached reviews come from parent via props (persisted in pendingReviews state).
   // draftReviews takes precedence when restoring or editing message drafts.
   const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
+  const draftReviewIdsByValueRef = useRef(new WeakMap<ReviewNoteDataForDisplay, string>());
+  const nextDraftReviewIdRef = useRef(0);
+  const isDraftReviewData = (value: unknown): value is ReviewNoteDataForDisplay =>
+    typeof value === "object" && value !== null;
+  const getDraftReviewId = (review: ReviewNoteDataForDisplay): string => {
+    const existingId = draftReviewIdsByValueRef.current.get(review);
+    if (existingId) return existingId;
+    const newId = `draft-review-${nextDraftReviewIdRef.current++}`;
+    draftReviewIdsByValueRef.current.set(review, newId);
+    return newId;
+  };
+
+  const withDraftReview = (
+    reviewId: string,
+    update: (reviews: ReviewNoteDataForDisplay[], reviewIndex: number) => ReviewNoteDataForDisplay[]
+  ) =>
+    setDraftReviews((prev) => {
+      if (prev === null) return prev;
+      const reviewIndex = prev.findIndex(
+        (review) => isDraftReviewData(review) && getDraftReviewId(review) === reviewId
+      );
+      return reviewIndex === -1 ? prev : update(prev, reviewIndex);
+    });
+
+  const removeDraftReview = (reviewId: string) =>
+    withDraftReview(reviewId, (prev, reviewIndex) =>
+      prev.filter((_, index) => index !== reviewIndex)
+    );
+
+  const updateDraftReviewNote = (reviewId: string, newNote: string) =>
+    withDraftReview(reviewId, (prev, reviewIndex) => {
+      const review = prev[reviewIndex];
+      if (!review || review.userNote === newNote) return prev;
+      const next = [...prev];
+      const updatedReview = { ...review, userNote: newNote };
+      draftReviewIdsByValueRef.current.set(updatedReview, reviewId);
+      next[reviewIndex] = updatedReview;
+      return next;
+    });
+
   // Creation sends can resolve after navigation; guard draft clears on unmounted inputs.
   const isMountedRef = useRef(true);
   useEffect(() => {
@@ -446,7 +487,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { open } = useSettings();
   const { selectedWorkspace, beginWorkspaceCreation, updateWorkspaceDraftSection } =
     useWorkspaceContext();
-  const { agentId, currentAgent } = useAgent();
+  const { agentId, currentAgent, agents } = useAgent();
+
+  // Keep auto-mode checks aligned with AgentModePicker behavior.
+  const normalizedAgentId =
+    typeof agentId === "string" && agentId.trim().length > 0
+      ? agentId.trim().toLowerCase()
+      : WORKSPACE_DEFAULTS.agentId;
+  const autoAvailable = agents.some((entry) => entry.uiSelectable && entry.id === "auto");
+  const isAutoAgent = normalizedAgentId === "auto" && autoAvailable;
 
   // Use current agent's uiColor, or neutral border until agents load
   const focusBorderColor = currentAgent?.uiColor ?? "var(--color-border-light)";
@@ -852,7 +901,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const hasTypedText = input.trim().length > 0;
   const hasImages = attachments.length > 0;
   const reviewOverrideActive = draftReviews !== null;
-  const draftReviewItems = draftReviews ?? [];
+  const draftReviewItems = (draftReviews ?? []).filter(isDraftReviewData);
   const reviewData = reviewOverrideActive
     ? draftReviewItems.length > 0
       ? draftReviewItems
@@ -862,16 +911,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       : undefined;
   const reviewIdsForCheck = reviewOverrideActive ? [] : attachedReviews.map((review) => review.id);
   const reviewPanelItems: Review[] = reviewOverrideActive
-    ? draftReviewItems.map((data, index) => ({
-        id: `draft-review-${index}`,
+    ? draftReviewItems.map((data) => ({
+        id: getDraftReviewId(data),
         data,
         status: "attached",
         createdAt: 0,
       }))
     : attachedReviews;
-  const hasReviews = reviewOverrideActive
-    ? draftReviewItems.length > 0
-    : attachedReviews.length > 0;
+  const hasReviews = reviewData !== undefined;
   // Disable send while Coder presets are loading (user could bypass preset validation)
   const policyBlocksCreateSend = variant === "creation" && creationRuntimePolicyError != null;
   const coderPresetsLoading =
@@ -882,9 +929,60 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !sendInFlightBlocksInput &&
     !coderPresetsLoading &&
     !policyBlocksCreateSend;
-  // Dispatch-mode choice (send-after-step vs send-after-turn) should track actual
-  // sendability — not just typed text. canSend already covers text, attachments, and reviews.
-  const canChooseDispatchMode = canInterrupt && canSend;
+  // Send defaults to tool-end on click; advanced dispatch modes remain available via
+  // right-click and touch long-press whenever there's a sendable workspace draft.
+  const canChooseDispatchMode = variant === "workspace" && canSend;
+  const sendModeMenu = useContextMenuPosition({
+    longPress: true,
+    canOpen: () => canChooseDispatchMode,
+  });
+  const {
+    isOpen: isSendModeMenuOpen,
+    onContextMenu: openSendModeMenuFromContext,
+    touchHandlers: sendModeMenuTouchHandlers,
+    suppressClickIfLongPress: suppressSendClickIfLongPress,
+    close: closeSendModeMenu,
+  } = sendModeMenu;
+
+  useEffect(() => {
+    if (canChooseDispatchMode) {
+      return;
+    }
+
+    closeSendModeMenu();
+  }, [canChooseDispatchMode, closeSendModeMenu]);
+
+  useEffect(() => {
+    if (!isSendModeMenuOpen) {
+      return;
+    }
+
+    const handleClickOutside = (event: MouseEvent) => {
+      if (sendModeMenuContainerRef.current?.contains(event.target as Node)) {
+        return;
+      }
+      closeSendModeMenu();
+    };
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+
+      // Mark Escape as handled so global interrupt listeners do not cancel the stream
+      // when users are only dismissing this inline send-mode menu.
+      event.preventDefault();
+      event.stopPropagation();
+      closeSendModeMenu();
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [closeSendModeMenu, isSendModeMenuOpen]);
 
   // User request: this sync effect runs on mount and when defaults/config change.
   // Only treat *real* agent changes as explicit (origin "agent"); everything else is "sync".
@@ -1778,6 +1876,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
 
+    closeSendModeMenu();
+
     const messageText = input.trim();
     const skillDiscovery: SkillResolutionTarget | null =
       variant === "creation"
@@ -2325,11 +2425,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           {variant === "workspace" && !hideReviewsDuringSend && (
             <AttachedReviewsPanel
               reviews={reviewPanelItems}
-              onDetachAll={reviewOverrideActive ? undefined : props.onDetachAllReviews}
-              onDetach={reviewOverrideActive ? undefined : props.onDetachReview}
-              onCheck={reviewOverrideActive ? undefined : props.onCheckReview}
-              onDelete={reviewOverrideActive ? undefined : props.onDeleteReview}
-              onUpdateNote={reviewOverrideActive ? undefined : props.onUpdateReviewNote}
+              onDetachAll={
+                reviewOverrideActive
+                  ? () =>
+                      setDraftReviews((prev) => (prev === null || prev.length === 0 ? prev : []))
+                  : props.onDetachAllReviews
+              }
+              onDetach={reviewOverrideActive ? removeDraftReview : props.onDetachReview}
+              onCheck={reviewOverrideActive ? removeDraftReview : props.onCheckReview}
+              onDelete={reviewOverrideActive ? removeDraftReview : props.onDeleteReview}
+              onUpdateNote={reviewOverrideActive ? updateDraftReviewNote : props.onUpdateReviewNote}
             />
           )}
 
@@ -2430,10 +2535,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       <span className="font-mono">{formatKeybind(KEYBINDS.CYCLE_MODEL)}</span>
                       <span> - change model</span>
                     </span>
-                    <span>
-                      <span className="font-mono">{formatKeybind(KEYBINDS.CYCLE_AGENT)}</span>
-                      <span> - change agent</span>
-                    </span>
+                    {!isAutoAgent && (
+                      <span>
+                        <span className="font-mono">{formatKeybind(KEYBINDS.CYCLE_AGENT)}</span>
+                        <span> - change agent</span>
+                      </span>
+                    )}
                   </div>
                 )}
 
@@ -2486,13 +2593,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     hiddenModels={hiddenModelsForSelector}
                     onOpenSettings={() => open("models")}
                     className="w-[clamp(5.5rem,28vw,8rem)] min-w-0"
-                  />
-                  <div className="hidden [@container(min-width:500px)]:[@media(hover:hover)_and_(pointer:fine)]:block">
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <HelpIndicator>?</HelpIndicator>
-                      </TooltipTrigger>
-                      <TooltipContent align="start" className="max-w-80 whitespace-normal">
+                    tooltipExtraContent={
+                      <>
                         <strong>Click to edit</strong>
                         <br />
                         <strong>{formatKeybind(KEYBINDS.CYCLE_MODEL)}</strong> to cycle models
@@ -2511,9 +2613,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                         <code>/model provider:model-name</code>
                         <br />
                         (e.g., <code>/model anthropic:claude-sonnet-4-5</code>)
-                      </TooltipContent>
-                    </Tooltip>
-                  </div>
+                      </>
+                    }
+                  />
                 </div>
 
                 {/* On narrow layouts, hide the thinking paddles to prevent control overlap. */}
@@ -2546,14 +2648,27 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   />
                 </div>
 
-                <div className="inline-flex items-center gap-0">
+                <div ref={sendModeMenuContainerRef} className="relative">
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
                         type="button"
-                        onClick={() => void handleSend()}
+                        onClick={() => {
+                          if (suppressSendClickIfLongPress()) {
+                            return;
+                          }
+
+                          void handleSend();
+                        }}
+                        onContextMenu={openSendModeMenuFromContext}
+                        onTouchStart={sendModeMenuTouchHandlers.onTouchStart}
+                        onTouchEnd={sendModeMenuTouchHandlers.onTouchEnd}
+                        onTouchMove={sendModeMenuTouchHandlers.onTouchMove}
+                        onTouchCancel={sendModeMenuTouchHandlers.onTouchEnd}
                         disabled={!canSend}
                         aria-label="Send message"
+                        aria-expanded={canChooseDispatchMode ? isSendModeMenuOpen : undefined}
+                        aria-haspopup={canChooseDispatchMode ? "menu" : undefined}
                         size="xs"
                         variant="ghost"
                         className={cn(
@@ -2568,21 +2683,47 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                         />
                       </Button>
                     </TooltipTrigger>
-                    <TooltipContent align="center">
-                      <span>Send message ({formatKeybind(KEYBINDS.SEND_MESSAGE)})</span>
+                    <TooltipContent align="start" className="max-w-80 whitespace-normal">
+                      <strong>Send message ({formatKeybind(KEYBINDS.SEND_MESSAGE)})</strong>
+                      {variant === "workspace" && (
+                        <>
+                          <br />
+                          <br />
+                          <strong>Right-click or long-press for advanced send modes:</strong>
+                          {SEND_DISPATCH_MODES.map((entry) => (
+                            <React.Fragment key={entry.mode}>
+                              <br />
+                              {entry.label}: <kbd>{formatKeybind(entry.keybind)}</kbd>
+                            </React.Fragment>
+                          ))}
+                        </>
+                      )}
                     </TooltipContent>
                   </Tooltip>
 
-                  {variant === "workspace" && (
-                    <SendModeDropdown
-                      disabled={!canChooseDispatchMode}
-                      triggerClassName="-ml-1 px-0"
-                      onSelect={(mode) => {
-                        void handleSend(
-                          mode === "tool-end" ? undefined : { queueDispatchMode: mode }
-                        );
-                      }}
-                    />
+                  {canChooseDispatchMode && isSendModeMenuOpen && (
+                    <div className="bg-separator border-border-light absolute right-0 bottom-full z-[1020] mb-1 min-w-[12.5rem] rounded-md border p-1.5 shadow-md">
+                      {SEND_DISPATCH_MODES.map((entry) => (
+                        <button
+                          key={entry.mode}
+                          type="button"
+                          className="hover:bg-hover focus-visible:bg-hover text-foreground flex w-full items-center justify-between gap-2 rounded-sm px-2.5 py-1 text-left text-xs"
+                          onClick={() => {
+                            closeSendModeMenu();
+                            void handleSend(
+                              entry.mode === "tool-end"
+                                ? undefined
+                                : { queueDispatchMode: entry.mode }
+                            );
+                          }}
+                        >
+                          <span className="whitespace-nowrap">{entry.label}</span>
+                          <kbd className="bg-background-secondary text-foreground border-border-medium rounded border px-1.5 py-px font-mono text-[10px] whitespace-nowrap">
+                            {formatKeybind(entry.keybind)}
+                          </kbd>
+                        </button>
+                      ))}
+                    </div>
                   )}
                 </div>
               </div>

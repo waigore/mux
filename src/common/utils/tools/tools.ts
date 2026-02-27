@@ -21,6 +21,9 @@ import { createTaskTerminateTool } from "@/node/services/tools/task_terminate";
 import { createTaskListTool } from "@/node/services/tools/task_list";
 import { createAgentSkillReadTool } from "@/node/services/tools/agent_skill_read";
 import { createAgentSkillReadFileTool } from "@/node/services/tools/agent_skill_read_file";
+import { createAgentSkillListTool } from "@/node/services/tools/agent_skill_list";
+import { createAgentSkillWriteTool } from "@/node/services/tools/agent_skill_write";
+import { createAgentSkillDeleteTool } from "@/node/services/tools/agent_skill_delete";
 import { createMuxGlobalAgentsReadTool } from "@/node/services/tools/mux_global_agents_read";
 import { createMuxGlobalAgentsWriteTool } from "@/node/services/tools/mux_global_agents_write";
 import { createAgentReportTool } from "@/node/services/tools/agent_report";
@@ -58,6 +61,8 @@ export interface ToolConfiguration {
   muxEnv?: Record<string, string>;
   /** Temporary directory for tool outputs in runtime's context (local or remote) */
   runtimeTempDir: string;
+  /** OpenAI wire format — webSearch requires "responses" */
+  openaiWireFormat?: "responses" | "chatCompletions";
   /** Overflow policy for bash tool output (optional, not exposed to AI) */
   overflow_policy?: "truncate" | "tmpfile";
   /** Background process manager for bash tool (optional, AI-only) */
@@ -318,6 +323,9 @@ export async function getToolsForModel(
   const nonRuntimeTools: Record<string, Tool> = {
     mux_global_agents_read: createMuxGlobalAgentsReadTool(config),
     mux_global_agents_write: createMuxGlobalAgentsWriteTool(config),
+    agent_skill_list: createAgentSkillListTool(config),
+    agent_skill_write: createAgentSkillWriteTool(config),
+    agent_skill_delete: createAgentSkillDeleteTool(config),
     ask_user_question: createAskUserQuestionTool(config),
     propose_plan: createProposePlanTool(config),
     ...(config.enableAgentReport ? { agent_report: createAgentReportTool(config) } : {}),
@@ -379,8 +387,10 @@ export async function getToolsForModel(
         // accepted by OpenAI's Structured Outputs implementation.
         const sanitizedMcpTools = mcpTools ? sanitizeMCPToolsForOpenAI(mcpTools) : {};
 
+        const useResponsesTools = config.openaiWireFormat !== "chatCompletions";
+
         // Only add web search for models that support it
-        if (modelId.includes("gpt-5") || modelId.includes("gpt-4")) {
+        if (useResponsesTools && (modelId.includes("gpt-5") || modelId.includes("gpt-4"))) {
           const { openai } = await import("@ai-sdk/openai");
           allTools = {
             ...baseTools,

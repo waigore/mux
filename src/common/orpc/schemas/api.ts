@@ -155,8 +155,11 @@ export const ProviderConfigInfoSchema = z.object({
   models: z.array(ProviderModelEntrySchema).optional(),
   /** OpenAI-specific fields */
   serviceTier: z.enum(["auto", "default", "flex", "priority"]).optional(),
+  wireFormat: z.enum(["responses", "chatCompletions"]).optional(),
+  store: z.boolean().optional(),
   /** Anthropic-specific fields */
   cacheTtl: z.enum(["5m", "1h"]).optional(),
+  disableBetaFeatures: z.boolean().optional(),
   /** OpenAI-only: whether Codex OAuth tokens are present in providers.jsonc */
   codexOauthSet: z.boolean().optional(),
   /**
@@ -179,7 +182,7 @@ export const providers = {
     input: z.object({
       provider: z.string(),
       keyPath: z.array(z.string()),
-      value: z.string(),
+      value: z.union([z.string(), z.boolean()]),
     }),
     output: ResultSchema(z.void(), z.string()),
   },
@@ -1597,7 +1600,6 @@ export const config = {
       muxGatewayModels: z.array(z.string()).optional(),
       defaultModel: z.string().optional(),
       hiddenModels: z.array(z.string()).optional(),
-      preferredCompactionModel: z.string().optional(),
       stopCoderWorkspaceOnArchive: z.boolean(),
       runtimeEnablement: z.record(z.string(), z.boolean()),
       defaultRuntime: z.string().nullable(),
@@ -1646,7 +1648,6 @@ export const config = {
     input: z.object({
       defaultModel: z.string().optional(),
       hiddenModels: z.array(z.string()).optional(),
-      preferredCompactionModel: z.string().optional(),
     }),
     output: z.void(),
   },

@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
-import { Loader2, Plus, ShieldCheck } from "lucide-react";
+import { ArrowRight, Info, Loader2, Plus, ShieldCheck } from "lucide-react";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { Button } from "@/browser/components/ui/button";
 import { ProviderWithIcon } from "@/browser/components/ProviderIcon";
@@ -11,20 +11,17 @@ import {
   SelectValue,
 } from "@/browser/components/ui/select";
 import { useAPI } from "@/browser/contexts/API";
-import { getSuggestedModels, useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
-import { migrateGatewayModel, useGateway } from "@/browser/hooks/useGatewayModels";
+import { useSettings } from "@/browser/contexts/SettingsContext";
+import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
+import { useGateway } from "@/browser/hooks/useGatewayModels";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { SearchableModelSelect } from "../components/SearchableModelSelect";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { isCodexOauthRequiredModelId } from "@/common/constants/codexOAuth";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { getModelProvider, supports1MContext } from "@/common/utils/ai/models";
 import { getAllowedProvidersForUi, isModelAllowedByPolicy } from "@/browser/utils/policyUi";
-import {
-  LAST_CUSTOM_MODEL_PROVIDER_KEY,
-  PREFERRED_COMPACTION_MODEL_KEY,
-} from "@/common/constants/storage";
+import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import {
   getProviderModelEntryContextWindowTokens,
@@ -118,6 +115,7 @@ export function ModelsSection() {
   );
 
   const { api } = useAPI();
+  const { open: openSettings } = useSettings();
   const { config, loading, updateModelsOptimistically } = useProvidersConfig();
   const [lastProvider, setLastProvider] = usePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "");
   const [newModelId, setNewModelId] = useState("");
@@ -132,29 +130,6 @@ export function ModelsSection() {
   const gateway = useGateway();
   const { has1MContext, toggle1MContext } = useProviderOptions();
 
-  // Compaction model preference
-  const [compactionModel, setCompactionModel] = usePersistedState<string>(
-    PREFERRED_COMPACTION_MODEL_KEY,
-    "",
-    { listener: true }
-  );
-
-  const setCompactionModelAndPersist = useCallback(
-    (value: string) => {
-      const canonical = migrateGatewayModel(value).trim();
-      setCompactionModel(canonical);
-
-      if (!api?.config?.updateModelPreferences) {
-        return;
-      }
-
-      api.config.updateModelPreferences({ preferredCompactionModel: canonical }).catch(() => {
-        // Best-effort only.
-      });
-    },
-    [api, setCompactionModel]
-  );
-
   // Read OAuth state from this component's provider config source to avoid
   // cross-hook timing mismatches while settings are loading/refetching.
   const codexOauthConfigured = config?.openai?.codexOauthSet === true;
@@ -165,16 +140,6 @@ export function ModelsSection() {
   const knownModelIds = Object.values(KNOWN_MODELS)
     .map((model) => model.id)
     .sort();
-
-  // All models (including hidden) for the settings dropdowns.
-  // PolicyService enforces model access on the backend, but we also filter here so users can't
-  // select models that will be denied at send time.
-  const allModels = getSuggestedModels(config).filter((model) =>
-    shouldShowModelInSettings(model, codexOauthConfigured)
-  );
-  const selectableModels = effectivePolicy
-    ? allModels.filter((model) => isModelAllowedByPolicy(effectivePolicy, model))
-    : allModels;
 
   // Check if a model already exists (for duplicate prevention)
   const modelExists = useCallback(
@@ -408,47 +373,6 @@ export function ModelsSection() {
         </div>
       )}
 
-      {/* Model Defaults - styled to match table aesthetic */}
-      <div className="border-border-medium overflow-hidden rounded-md border">
-        {/* Header row - matches table header */}
-        <div className="border-border-medium bg-background-secondary/50 border-b px-2 py-1.5 md:px-3">
-          <span className="text-muted text-xs font-medium">Model Defaults</span>
-        </div>
-        {/* Content rows - match table row styling */}
-        <div className="divide-border-medium divide-y">
-          {/* Default Model row */}
-          <div className="flex items-center gap-4 px-2 py-2 md:px-3">
-            <div className="w-28 shrink-0 md:w-32">
-              <div className="text-muted text-xs">Default Model</div>
-              <div className="text-muted-light text-[10px]">New workspaces</div>
-            </div>
-            <div className="min-w-0 flex-1">
-              <SearchableModelSelect
-                value={defaultModel}
-                onChange={setDefaultModel}
-                models={selectableModels}
-                placeholder="Select model"
-              />
-            </div>
-          </div>
-          {/* Compaction Model row */}
-          <div className="flex items-center gap-4 px-2 py-2 md:px-3">
-            <div className="w-28 shrink-0 md:w-32">
-              <div className="text-muted text-xs">Compaction Model</div>
-              <div className="text-muted-light text-[10px]">History summary</div>
-            </div>
-            <div className="min-w-0 flex-1">
-              <SearchableModelSelect
-                value={compactionModel}
-                onChange={setCompactionModelAndPersist}
-                models={selectableModels}
-                emptyOption={{ value: "", label: "Use workspace model" }}
-              />
-            </div>
-          </div>
-        </div>
-      </div>
-
       {/* Custom Models */}
       <div className="space-y-3">
         <div className="text-muted text-xs font-medium tracking-wide uppercase">Custom Models</div>
@@ -623,6 +547,28 @@ export function ModelsSection() {
               ))}
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <div className="border-border-medium bg-background-secondary/40 text-muted rounded-md border px-3 py-2.5 text-xs">
+        <div className="flex items-start gap-2">
+          <Info className="text-accent mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+          <div className="space-y-1">
+            <p>
+              Agent-specific model defaults and thinking levels (Compact and others) are configured
+              in <span className="text-foreground font-medium">Settings → Agents</span>.
+            </p>
+            <Button
+              type="button"
+              variant="link"
+              size="sm"
+              onClick={() => openSettings("tasks")}
+              className="text-accent h-auto px-0 py-0 text-xs"
+            >
+              Open Agents settings
+              <ArrowRight className="h-3.5 w-3.5" />
+            </Button>
+          </div>
         </div>
       </div>
 

@@ -1,12 +1,8 @@
 import "../dom";
-import { act, fireEvent, waitFor } from "@testing-library/react";
+import { fireEvent, waitFor } from "@testing-library/react";
 
 import { preloadTestModules, type TestEnvironment } from "../../ipc/setup";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { workspaceStore } from "@/browser/stores/WorkspaceStore";
-import { getReviewsKey } from "@/common/constants/storage";
-import type { ReviewsState } from "@/common/types/review";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 
 import { createAppHarness, type AppHarness } from "../harness";
@@ -48,83 +44,6 @@ async function waitForForegroundToolCallId(
   }
 }
 
-function getSendModeButton(container: HTMLElement): HTMLButtonElement | null {
-  const buttons = Array.from(
-    container.querySelectorAll('button[aria-label="Send mode options"]')
-  ) as HTMLButtonElement[];
-
-  // Multiple ChatInput instances can be mounted; the active workspace input is the last one.
-  return buttons.at(-1) ?? null;
-}
-
-function getSendModeTrigger(container: HTMLElement): HTMLButtonElement | null {
-  const button = getSendModeButton(container);
-  if (!button || button.disabled) {
-    return null;
-  }
-
-  return button;
-}
-
-async function waitForSendModeTrigger(container: HTMLElement): Promise<HTMLButtonElement> {
-  return waitFor(
-    () => {
-      const trigger = getSendModeTrigger(container);
-      if (!trigger) {
-        throw new Error("Send mode trigger is not visible");
-      }
-      return trigger;
-    },
-    { timeout: 30_000 }
-  );
-}
-
-async function openSendModeMenu(container: HTMLElement): Promise<void> {
-  let lastError: Error | null = null;
-
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const trigger = await waitForSendModeTrigger(container);
-    act(() => {
-      fireEvent.click(trigger);
-    });
-
-    try {
-      await waitFor(
-        () => {
-          const expandedTrigger = container.querySelector(
-            'button[aria-label="Send mode options"][aria-expanded="true"]'
-          );
-          if (!expandedTrigger) {
-            throw new Error("Send mode menu did not open");
-          }
-        },
-        { timeout: 2_000 }
-      );
-      return;
-    } catch (error) {
-      if (error instanceof Error) {
-        lastError = error;
-      } else {
-        lastError = new Error("Send mode menu did not open");
-      }
-    }
-  }
-
-  throw lastError ?? new Error("Send mode menu did not open");
-}
-
-async function waitForCanInterrupt(workspaceId: string, expected: boolean): Promise<void> {
-  await waitFor(
-    () => {
-      const state = workspaceStore.getWorkspaceSidebarState(workspaceId);
-      if (state.canInterrupt !== expected) {
-        throw new Error(`Expected canInterrupt=${expected}, got ${state.canInterrupt}`);
-      }
-    },
-    { timeout: 30_000 }
-  );
-}
-
 async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaElement> {
   return waitFor(
     () => {
@@ -147,86 +66,134 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
 }
 
 async function startStreamingTurn(app: AppHarness, label: string): Promise<void> {
-  // Use a long mock echo payload so canInterrupt stays true long enough for dropdown interactions.
+  // Keep stream alive so queued-send mode chooser can be used.
   const longStreamingTail = " keep-streaming".repeat(600);
   await app.chat.send(`[mock:wait-start] ${label}${longStreamingTail}`);
   app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
-  await waitForCanInterrupt(app.workspaceId, true);
 }
 
-describe("SendModeDropdown (mock AI router)", () => {
+async function waitForSendModeMenuTrigger(container: HTMLElement): Promise<HTMLButtonElement> {
+  return waitFor(
+    () => {
+      const buttons = Array.from(
+        container.querySelectorAll('button[aria-label="Send message"]')
+      ) as HTMLButtonElement[];
+      const trigger = [...buttons]
+        .reverse()
+        .find((button) => button.getAttribute("aria-haspopup") === "menu" && !button.disabled);
+      if (!trigger) {
+        throw new Error("Send mode menu trigger not ready");
+      }
+      return trigger;
+    },
+    { timeout: 30_000 }
+  );
+}
+
+async function openSendModeMenu(container: HTMLElement): Promise<void> {
+  const trigger = await waitForSendModeMenuTrigger(container);
+  fireEvent.contextMenu(trigger, { clientX: 12, clientY: 12 });
+
+  await waitFor(
+    () => {
+      const row = Array.from(container.querySelectorAll("button")).find((button) =>
+        button.textContent?.includes("Send after turn")
+      );
+      if (!row) {
+        throw new Error("Send mode menu did not open");
+      }
+    },
+    { timeout: 30_000 }
+  );
+}
+
+describe("Send dispatch modes (mock AI router)", () => {
   beforeAll(async () => {
     await preloadTestModules();
   });
 
-  test("dropdown trigger is visible but disabled when not streaming", async () => {
-    const app = await createAppHarness({ branchPrefix: "send-mode-dropdown" });
+  test("does not render a send mode caret trigger next to the send button", async () => {
+    const app = await createAppHarness({ branchPrefix: "send-mode-tooltip" });
 
     try {
-      const trigger = getSendModeButton(app.view.container);
-      expect(trigger).not.toBeNull();
-      expect(trigger?.disabled).toBe(true);
+      const modeTrigger = app.view.container.querySelector(
+        'button[aria-label="Send mode options"]'
+      );
+      expect(modeTrigger).toBeNull();
     } finally {
       await app.dispose();
     }
   }, 60_000);
 
-  test("dropdown trigger visible while streaming", async () => {
-    const app = await createAppHarness({ branchPrefix: "send-mode-dropdown" });
+  test("click sends tool-end by default while context menu + keybind dispatch modes remain", async () => {
+    const app = await createAppHarness({ branchPrefix: "send-mode-pointer" });
+
+    let unregisterTurn: (() => void) | undefined;
+    let unregisterStep: (() => void) | undefined;
 
     try {
-      await startStreamingTurn(app, "show send mode trigger while streaming");
-
-      const disabledTrigger = await waitFor(
-        () => {
-          const trigger = getSendModeButton(app.view.container);
-          if (!trigger) {
-            throw new Error("Send mode trigger is not visible");
-          }
-          return trigger;
-        },
-        { timeout: 30_000 }
-      );
-      expect(disabledTrigger.disabled).toBe(true);
-
-      await app.chat.typeWithoutSending("enable send mode dropdown");
-      await waitForSendModeTrigger(app.view.container);
-
-      await app.chat.expectStreamComplete(60_000);
-
-      await waitFor(
-        () => {
-          const trigger = getSendModeButton(app.view.container);
-          expect(trigger).not.toBeNull();
-          expect(trigger?.disabled).toBe(true);
-        },
-        { timeout: 30_000 }
-      );
-    } finally {
-      await app.dispose();
-    }
-  }, 60_000);
-
-  test("dropdown menu shows labels and keybind chips", async () => {
-    const app = await createAppHarness({ branchPrefix: "send-mode-dropdown" });
-
-    try {
-      await startStreamingTurn(app, "open send mode dropdown menu");
-      await app.chat.typeWithoutSending("open send mode menu");
-
+      const idleTurnMessage = "turn-end idle context-menu test";
+      await app.chat.typeWithoutSending(idleTurnMessage);
       await openSendModeMenu(app.view.container);
 
-      const stepRow = await waitFor(
+      const idleTurnRow = await waitFor(
         () => {
           const rows = Array.from(app.view.container.querySelectorAll("button"));
-          const row = rows.find((button) => button.textContent?.includes("Send after step"));
+          const row = rows.find((button) => button.textContent?.includes("Send after turn"));
           if (!row) {
-            throw new Error("Send after step row not found");
+            throw new Error("Send after turn row not found for idle context menu");
           }
           return row;
         },
         { timeout: 30_000 }
       );
+      fireEvent.click(idleTurnRow);
+
+      await app.chat.expectTranscriptContains(`Mock response: ${idleTurnMessage}`);
+      await app.chat.expectStreamComplete();
+
+      await startStreamingTurn(app, "click send while streaming");
+
+      const clickStepMessage = "tool-end click test";
+      await app.chat.typeWithoutSending(clickStepMessage);
+      const sendButton = await waitForSendModeMenuTrigger(app.view.container);
+      fireEvent.click(sendButton);
+
+      await waitFor(
+        () => {
+          const rows = Array.from(app.view.container.querySelectorAll("button"));
+          const row = rows.find((button) => button.textContent?.includes("Send after turn"));
+          if (row) {
+            throw new Error("Left-clicking Send should not open send mode menu");
+          }
+        },
+        { timeout: 5_000 }
+      );
+
+      await app.chat.expectTranscriptContains(`Mock response: ${clickStepMessage}`);
+      await app.chat.expectStreamComplete();
+
+      await startStreamingTurn(app, "open send mode menu while streaming");
+
+      const pointerTurnMessage = "turn-end pointer test";
+      await app.chat.typeWithoutSending(pointerTurnMessage);
+      await openSendModeMenu(app.view.container);
+
+      fireEvent.keyDown(document, { key: "Escape" });
+
+      await waitFor(
+        () => {
+          const rows = Array.from(app.view.container.querySelectorAll("button"));
+          const row = rows.find((button) => button.textContent?.includes("Send after turn"));
+          if (row) {
+            throw new Error("Send mode menu should close on Escape");
+          }
+        },
+        { timeout: 30_000 }
+      );
+
+      // Re-open after Escape: if Escape interrupted the stream, this menu cannot open.
+      await openSendModeMenu(app.view.container);
 
       const turnRow = await waitFor(
         () => {
@@ -239,143 +206,74 @@ describe("SendModeDropdown (mock AI router)", () => {
         },
         { timeout: 30_000 }
       );
+      fireEvent.click(turnRow);
 
-      expect(stepRow.querySelector("kbd")).not.toBeNull();
-      expect(turnRow.querySelector("kbd")).not.toBeNull();
+      await app.chat.expectTranscriptContains(`Mock response: ${pointerTurnMessage}`);
+      await app.chat.expectStreamComplete();
 
-      const keybindChips = app.view.container.querySelectorAll("kbd");
-      expect(keybindChips.length).toBeGreaterThanOrEqual(2);
-
-      await app.chat.expectStreamComplete(60_000);
-    } finally {
-      await app.dispose();
-    }
-  }, 60_000);
-
-  test("send-after-turn does NOT auto-background foreground bash", async () => {
-    const app = await createAppHarness({ branchPrefix: "send-mode-dropdown" });
-
-    let unregister: (() => void) | undefined;
-
-    try {
       const manager = getBackgroundProcessManager(app.env);
-      const toolCallId = "bash-foreground-send-after-turn";
-      let backgrounded = false;
 
-      const registration = manager.registerForegroundProcess(
+      const turnToolCallId = "bash-foreground-send-after-turn";
+      let turnBackgrounded = false;
+
+      const turnRegistration = manager.registerForegroundProcess(
         app.workspaceId,
-        toolCallId,
+        turnToolCallId,
         "echo foreground bash for send-after-turn",
         "foreground bash for send-after-turn",
         () => {
-          backgrounded = true;
-          unregister?.();
+          turnBackgrounded = true;
+          unregisterTurn?.();
         }
       );
 
-      unregister = registration.unregister;
+      unregisterTurn = turnRegistration.unregister;
 
-      await waitForForegroundToolCallId(app.env, app.workspaceId, toolCallId);
+      await waitForForegroundToolCallId(app.env, app.workspaceId, turnToolCallId);
 
-      const turnEndMessage = "turn-end test";
+      const turnEndMessage = "turn-end keyboard test";
       await app.chat.typeWithoutSending(turnEndMessage);
-      const textarea = await getActiveTextarea(app.view.container);
+      let textarea = await getActiveTextarea(app.view.container);
       fireEvent.keyDown(textarea, { key: "Enter", ctrlKey: true });
 
       await app.chat.expectTranscriptContains(`Mock response: ${turnEndMessage}`);
       await app.chat.expectStreamComplete();
+      expect(turnBackgrounded).toBe(false);
 
-      expect(backgrounded).toBe(false);
-    } finally {
-      unregister?.();
-      await app.dispose();
-    }
-  }, 60_000);
+      const stepToolCallId = "bash-foreground-send-after-step";
+      let stepBackgrounded = false;
 
-  test("send-after-step still auto-backgrounds foreground bash", async () => {
-    const app = await createAppHarness({ branchPrefix: "send-mode-dropdown" });
-
-    let unregister: (() => void) | undefined;
-
-    try {
-      const manager = getBackgroundProcessManager(app.env);
-      const toolCallId = "bash-foreground-send-after-step";
-      let backgrounded = false;
-
-      const registration = manager.registerForegroundProcess(
+      const stepRegistration = manager.registerForegroundProcess(
         app.workspaceId,
-        toolCallId,
+        stepToolCallId,
         "echo foreground bash for send-after-step",
         "foreground bash for send-after-step",
         () => {
-          backgrounded = true;
-          unregister?.();
+          stepBackgrounded = true;
+          unregisterStep?.();
         }
       );
 
-      unregister = registration.unregister;
+      unregisterStep = stepRegistration.unregister;
 
-      await waitForForegroundToolCallId(app.env, app.workspaceId, toolCallId);
+      await waitForForegroundToolCallId(app.env, app.workspaceId, stepToolCallId);
 
-      const toolEndMessage = "tool-end test";
-      await app.chat.typeWithoutSending(toolEndMessage);
-      const textarea = await getActiveTextarea(app.view.container);
+      const stepEndMessage = "tool-end test";
+      await app.chat.typeWithoutSending(stepEndMessage);
+      textarea = await getActiveTextarea(app.view.container);
       fireEvent.keyDown(textarea, { key: "Enter" });
 
-      await app.chat.expectTranscriptContains(`Mock response: ${toolEndMessage}`);
-
+      await app.chat.expectTranscriptContains(`Mock response: ${stepEndMessage}`);
       await waitFor(
         () => {
-          expect(backgrounded).toBe(true);
+          expect(stepBackgrounded).toBe(true);
         },
         { timeout: 60_000 }
       );
-
       await app.chat.expectStreamComplete();
     } finally {
-      unregister?.();
-      await app.dispose();
-    }
-  }, 60_000);
-
-  test("dropdown enabled with review-only draft during streaming (no typed text)", async () => {
-    const app = await createAppHarness({ branchPrefix: "send-mode-dropdown" });
-
-    try {
-      await startStreamingTurn(app, "review-only dropdown enablement");
-
-      // Verify dropdown is disabled with no content
-      const disabledTrigger = getSendModeButton(app.view.container);
-      expect(disabledTrigger).not.toBeNull();
-      expect(disabledTrigger?.disabled).toBe(true);
-
-      // Seed an attached review via persisted state (useReviews listens cross-component)
-      act(() => {
-        updatePersistedState<ReviewsState>(getReviewsKey(app.workspaceId), {
-          workspaceId: app.workspaceId,
-          reviews: {
-            "review-1": {
-              id: "review-1",
-              status: "attached",
-              createdAt: Date.now(),
-              data: {
-                filePath: "src/example.ts",
-                lineRange: "+1",
-                selectedCode: "const x = 1;",
-                userNote: "Check this",
-              },
-            },
-          },
-          lastUpdated: Date.now(),
-        });
-      });
-
-      // Dropdown should become enabled — canSend is true via review, canInterrupt is true via stream
-      const enabledTrigger = await waitForSendModeTrigger(app.view.container);
-      expect(enabledTrigger.disabled).toBe(false);
-
-      await app.chat.expectStreamComplete(60_000);
-    } finally {
+      unregisterTurn?.();
+      unregisterStep?.();
       await app.dispose();
     }
   }, 60_000);

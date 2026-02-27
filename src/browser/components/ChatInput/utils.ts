@@ -2,27 +2,10 @@ import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import { parseCommand } from "@/browser/utils/slashCommands/parser";
 import type { APIClient } from "@/browser/contexts/API";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
-import type { SendMessageError } from "@/common/types/errors";
 import type { ParsedRuntime } from "@/common/types/runtime";
 import { buildAgentSkillMetadata, type MuxMessageMetadata } from "@/common/types/message";
 import type { FilePart } from "@/common/orpc/types";
 import type { ChatAttachment } from "../ChatAttachments";
-import type { Review } from "@/common/types/review";
-
-/**
- * Extract error message from SendMessageError or string
- * Handles both string errors and structured error objects
- */
-export function extractErrorMessage(error: SendMessageError | string): string {
-  if (typeof error === "string") {
-    return error;
-  }
-  return "raw" in error ? error.raw : error.type;
-}
-
-// -----------------------------------------------------------------------------
-// Skill Invocation Helpers
-// -----------------------------------------------------------------------------
 
 export type CreationRuntimeValidationError =
   | { mode: "docker"; kind: "missingImage" }
@@ -142,10 +125,6 @@ export async function parseCommandWithSkillInvocation(options: {
   return { parsed: skillInvocation ? null : parsed, skillInvocation };
 }
 
-// -----------------------------------------------------------------------------
-// Runtime Validation
-// -----------------------------------------------------------------------------
-
 export function validateCreationRuntime(
   runtime: ParsedRuntime,
   coderPresetCount: number
@@ -181,10 +160,6 @@ export function validateCreationRuntime(
   return null;
 }
 
-// -----------------------------------------------------------------------------
-// Attachment Conversion Helpers
-// -----------------------------------------------------------------------------
-
 export function filePartsToChatAttachments(
   fileParts: FilePart[],
   idPrefix: string
@@ -195,23 +170,4 @@ export function filePartsToChatAttachments(
     mediaType: part.mediaType,
     filename: part.filename,
   }));
-}
-
-// -----------------------------------------------------------------------------
-// Review Helpers
-// -----------------------------------------------------------------------------
-
-/**
- * Extract review data from attached reviews for sending.
- * Returns undefined if no reviews attached.
- */
-export function getReviewData(reviews: Review[]): Array<Review["data"]> | undefined {
-  return reviews.length > 0 ? reviews.map((r) => r.data) : undefined;
-}
-
-/**
- * Extract review IDs from attached reviews.
- */
-export function getReviewIds(reviews: Review[]): string[] {
-  return reviews.map((r) => r.id);
 }

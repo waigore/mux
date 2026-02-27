@@ -754,6 +754,63 @@ export const TOOL_DEFINITIONS = {
       })
       .strict(),
   },
+  agent_skill_list: {
+    description:
+      "List global skills from the global skills directory for management in Chat with Mux.",
+    schema: z
+      .object({
+        includeUnadvertised: z
+          .boolean()
+          .nullish()
+          .describe("When true, includes skills with advertise: false"),
+      })
+      .strict(),
+  },
+  agent_skill_write: {
+    description:
+      "Create or update a file within a global skill directory. " +
+      "When writing SKILL.md, the content is validated as a skill definition (YAML frontmatter + markdown body). " +
+      "Creates the skill directory if it doesn't exist. " +
+      "For SKILL.md: include only required frontmatter fields (name, description). " +
+      "Preserve user-provided wording and structure. " +
+      "Do not add optional fields (advertise, license, etc.) unless explicitly requested. " +
+      "The name field is auto-derived from the skill name argument if omitted or mismatched.",
+    schema: z
+      .object({
+        name: SkillNameSchema.describe("Skill name (directory name under the global skills root)"),
+        filePath: z
+          .string()
+          .min(1)
+          .nullish()
+          .describe("Relative path within skill directory. Defaults to SKILL.md"),
+        content: z.string().min(1).describe("File content to write"),
+      })
+      .strict(),
+  },
+  agent_skill_delete: {
+    description:
+      "Delete either a file within a global skill directory or the entire skill directory. " +
+      "Requires confirm: true. Cannot delete built-in skills.",
+    schema: z
+      .object({
+        name: SkillNameSchema.describe("Skill name to delete"),
+        target: z
+          .enum(["file", "skill"])
+          .nullish()
+          .describe(
+            "Deletion target: 'file' to delete a specific file, 'skill' to remove the entire skill directory (defaults to file)"
+          ),
+        filePath: z
+          .string()
+          .min(1)
+          .nullish()
+          .describe(
+            "Relative file path within the skill directory to delete. Required when target is 'file'"
+          ),
+        confirm: z.boolean().describe("Must be true to confirm deletion"),
+      })
+      .strict(),
+  },
 
   file_edit_replace_string: {
     description:
@@ -941,8 +998,8 @@ export const TOOL_DEFINITIONS = {
       "The TODO list is displayed to the user at all times. " +
       "Replace the entire list on each call - the AI tracks which tasks are completed.\n" +
       "\n" +
-      "Mark ONE task as in_progress at a time. " +
-      "Order tasks as: completed first, then in_progress (max 1), then pending last. " +
+      "Mark tasks as in_progress when actively being worked on (multiple allowed for parallel work). " +
+      "Order tasks as: completed first, then in_progress, then pending last. " +
       "Use appropriate tense in content: past tense for completed (e.g., 'Added tests'), " +
       "present progressive for in_progress (e.g., 'Adding tests'), " +
       "and imperative/infinitive for pending (e.g., 'Add tests').\n" +
@@ -1448,7 +1505,13 @@ export function getAvailableTools(
   // Note: Tool availability is controlled by agent tool policy (allowlist), not mode checks here.
   const baseTools = [
     ...(options?.enableMuxGlobalAgentsTools
-      ? ["mux_global_agents_read", "mux_global_agents_write"]
+      ? [
+          "mux_global_agents_read",
+          "mux_global_agents_write",
+          "agent_skill_list",
+          "agent_skill_write",
+          "agent_skill_delete",
+        ]
       : []),
     "file_read",
     "agent_skill_read",

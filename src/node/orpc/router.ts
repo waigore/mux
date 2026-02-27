@@ -568,7 +568,6 @@ export const router = (authToken?: string) => {
             muxGatewayModels: config.muxGatewayModels,
             defaultModel: config.defaultModel,
             hiddenModels: config.hiddenModels,
-            preferredCompactionModel: config.preferredCompactionModel,
             stopCoderWorkspaceOnArchive: config.stopCoderWorkspaceOnArchive !== false,
             runtimeEnablement: normalizeRuntimeEnablement(config.runtimeEnablement),
             defaultRuntime: config.defaultRuntime ?? null,
@@ -669,10 +668,6 @@ export const router = (authToken?: string) => {
               }
 
               next.hiddenModels = normalizedHidden;
-            }
-
-            if (input.preferredCompactionModel !== undefined) {
-              next.preferredCompactionModel = normalizeModelString(input.preferredCompactionModel);
             }
 
             return next;
@@ -4197,6 +4192,16 @@ export const router = (authToken?: string) => {
         .output(schemas.analytics.getCacheHitRatioByProvider.output)
         .handler(async ({ context, input }) => {
           return context.analyticsService.getCacheHitRatioByProvider(
+            input.projectPath ?? null,
+            input.from ?? null,
+            input.to ?? null
+          );
+        }),
+      getDelegationSummary: t
+        .input(schemas.analytics.getDelegationSummary.input)
+        .output(schemas.analytics.getDelegationSummary.output)
+        .handler(async ({ context, input }) => {
+          return context.analyticsService.getDelegationSummary(
             input.projectPath ?? null,
             input.from ?? null,
             input.to ?? null

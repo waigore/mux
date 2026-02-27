@@ -19,6 +19,7 @@ import {
 import { cn } from "@/common/lib/utils";
 import { SelectableDiffRenderer } from "../../shared/DiffRenderer";
 import { ImmersiveMinimap } from "./ImmersiveMinimap";
+import { buildNewLineNumberToIndexMap, buildOldLineNumberToIndexMap } from "./immersiveMinimapMath";
 import { KeycapGroup } from "@/browser/components/ui/Keycap";
 import { useAPI } from "@/browser/contexts/API";
 import { formatLineRangeCompact } from "@/browser/utils/review/lineRange";
@@ -71,8 +72,11 @@ interface InlineComposerRequest {
   requestId: number;
   prefill: string;
   hunkId: string;
-  startOffset: number;
-  endOffset: number;
+  /** Absolute overlay indices so composer placement stays locked to marked rows. */
+  startIndex: number;
+  endIndex: number;
+  /** Absolute overlay index for composer placement (cursor position). */
+  cursorIndex: number;
 }
 
 interface InlineReviewEditRequest {
@@ -94,6 +98,7 @@ interface HunkLineRange {
   startIndex: number;
   endIndex: number;
   firstModifiedIndex: number | null;
+  lastModifiedIndex: number | null;
 }
 
 interface ImmersiveOverlayData {
@@ -202,6 +207,7 @@ function buildOverlayFromFileContent(
 
     const hunkStartIndex = lineHunkIds.length;
     let firstModifiedIndex: number | null = null;
+    let lastModifiedIndex: number | null = null;
 
     for (const line of splitDiffLines(hunk.content)) {
       const prefix = line[0] ?? " ";
@@ -209,8 +215,9 @@ function buildOverlayFromFileContent(
         continue;
       }
 
-      if (firstModifiedIndex === null && (prefix === "+" || prefix === "-")) {
-        firstModifiedIndex = lineHunkIds.length;
+      if (prefix === "+" || prefix === "-") {
+        firstModifiedIndex ??= lineHunkIds.length;
+        lastModifiedIndex = lineHunkIds.length;
       }
 
       pushDisplayLine(`${prefix}${line.slice(1)}`, hunk.id);
@@ -224,6 +231,7 @@ function buildOverlayFromFileContent(
         startIndex: hunkStartIndex,
         endIndex: lineHunkIds.length - 1,
         firstModifiedIndex,
+        lastModifiedIndex,
       });
     }
   }
@@ -265,6 +273,7 @@ function buildOverlayFromHunks(sortedHunks: DiffHunk[]): ImmersiveOverlayData {
 
     const hunkStartIndex = lineHunkIds.length;
     let firstModifiedIndex: number | null = null;
+    let lastModifiedIndex: number | null = null;
 
     for (const line of splitDiffLines(hunk.content)) {
       const prefix = line[0] ?? " ";
@@ -272,8 +281,9 @@ function buildOverlayFromHunks(sortedHunks: DiffHunk[]): ImmersiveOverlayData {
         continue;
       }
 
-      if (firstModifiedIndex === null && (prefix === "+" || prefix === "-")) {
-        firstModifiedIndex = lineHunkIds.length;
+      if (prefix === "+" || prefix === "-") {
+        firstModifiedIndex ??= lineHunkIds.length;
+        lastModifiedIndex = lineHunkIds.length;
       }
 
       pushDisplayLine(`${prefix}${line.slice(1)}`, hunk.id);
@@ -284,6 +294,7 @@ function buildOverlayFromHunks(sortedHunks: DiffHunk[]): ImmersiveOverlayData {
         startIndex: hunkStartIndex,
         endIndex: lineHunkIds.length - 1,
         firstModifiedIndex,
+        lastModifiedIndex,
       });
     }
   });
@@ -299,6 +310,12 @@ function isSelectionInsideRange(selection: SelectedLineRange, range: HunkLineRan
   const start = Math.min(selection.startIndex, selection.endIndex);
   const end = Math.max(selection.startIndex, selection.endIndex);
   return start >= range.startIndex && end <= range.endIndex;
+}
+
+function isLineInsideSelection(lineIndex: number, selection: SelectedLineRange): boolean {
+  const start = Math.min(selection.startIndex, selection.endIndex);
+  const end = Math.max(selection.startIndex, selection.endIndex);
+  return lineIndex >= start && lineIndex <= end;
 }
 
 /** Resolve the hunk that contains a given overlay line index using the lineHunkIds lookup. */
@@ -594,6 +611,41 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     [props.reviewsByFilePath]
   );
 
+  // Map review line ranges → diff line indices for minimap comment indicators
+  const commentLineIndices: ReadonlySet<number> = (() => {
+    if (!activeFilePath || overlayData.content.length === 0) return new Set<number>();
+    const reviews = props.reviewsByFilePath.get(activeFilePath);
+    if (!reviews || reviews.length === 0) return new Set<number>();
+
+    const newLineMap = buildNewLineNumberToIndexMap(overlayData.content);
+    let oldLineMap: Map<number, number> | null = null;
+    const indices = new Set<number>();
+    for (const review of reviews) {
+      const parsed = parseReviewLineRange(review.data.lineRange);
+      if (!parsed) continue;
+
+      let lineMap: Map<number, number>;
+      let range: { start: number; end: number } | undefined;
+
+      if (parsed.new) {
+        lineMap = newLineMap;
+        range = parsed.new;
+      } else if (parsed.old) {
+        oldLineMap ??= buildOldLineNumberToIndexMap(overlayData.content);
+        lineMap = oldLineMap;
+        range = parsed.old;
+      } else {
+        continue;
+      }
+
+      for (let ln = range.start; ln <= range.end; ln++) {
+        const idx = lineMap.get(ln);
+        if (idx != null) indices.add(idx);
+      }
+    }
+    return indices;
+  })();
+
   const [inlineComposerRequest, setInlineComposerRequest] = useState<InlineComposerRequest | null>(
     null
   );
@@ -760,11 +812,13 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     const shouldSelectEntireHunk = pendingJumpSelectAllHunkIdRef.current === resolvedSelectedHunkId;
     if (shouldSelectEntireHunk) {
       pendingJumpSelectAllHunkIdRef.current = null;
-      const hunkAnchorLine = selectedHunkRange.firstModifiedIndex ?? selectedHunkRange.startIndex;
-      setActiveLineIndex(hunkAnchorLine);
+      // Use actual modified boundaries (without context padding) for the highlight
+      const modifiedStart = selectedHunkRange.firstModifiedIndex ?? selectedHunkRange.startIndex;
+      const modifiedEnd = selectedHunkRange.lastModifiedIndex ?? selectedHunkRange.endIndex;
+      setActiveLineIndex(modifiedEnd);
       setSelectedLineRange({
-        startIndex: selectedHunkRange.startIndex,
-        endIndex: selectedHunkRange.endIndex,
+        startIndex: modifiedStart,
+        endIndex: modifiedEnd,
       });
       return;
     }
@@ -786,6 +840,13 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       }
 
       if (isSelectionInsideRange(previousSelection, selectedHunkRange)) {
+        return previousSelection;
+      }
+
+      const cursorLineIndex = activeLineIndexRef.current;
+      if (cursorLineIndex !== null && isLineInsideSelection(cursorLineIndex, previousSelection)) {
+        // Keep cross-hunk Shift selections alive while the moving cursor edge
+        // tracks into the next hunk.
         return previousSelection;
       }
 
@@ -904,99 +965,88 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
   }, [props.reviewActions]);
 
   const getCurrentLineSelection = useCallback((): SelectedLineRange | null => {
+    if (selectedLineRange) {
+      return selectedLineRange;
+    }
+
     if (activeLineIndex === null) {
       return null;
     }
 
-    if (!selectedLineRange) {
-      return { startIndex: activeLineIndex, endIndex: activeLineIndex };
+    return { startIndex: activeLineIndex, endIndex: activeLineIndex };
+  }, [activeLineIndex, selectedLineRange]);
+
+  const selectedLineSummary = useMemo(() => {
+    const selection = getCurrentLineSelection();
+    if (!selection) {
+      return null;
     }
 
     return {
-      startIndex: Math.min(selectedLineRange.startIndex, selectedLineRange.endIndex),
-      endIndex: Math.max(selectedLineRange.startIndex, selectedLineRange.endIndex),
+      startIndex: Math.min(selection.startIndex, selection.endIndex),
+      endIndex: Math.max(selection.startIndex, selection.endIndex),
     };
-  }, [activeLineIndex, selectedLineRange]);
-
-  const selectedLineSummary = getCurrentLineSelection();
+  }, [getCurrentLineSelection]);
 
   const openComposer = useCallback(
     (prefill: string, selectionOverride?: SelectedLineRange) => {
+      const lineCount = overlayData.lineHunkIds.length;
+      if (lineCount === 0) {
+        return;
+      }
+
+      const clampToOverlay = (lineIndex: number): number =>
+        Math.max(0, Math.min(lineCount - 1, lineIndex));
+
       const selection = selectionOverride ??
         getCurrentLineSelection() ?? {
           startIndex: activeLineIndexRef.current ?? 0,
           endIndex: activeLineIndexRef.current ?? 0,
         };
+      const effectiveSelection: SelectedLineRange = {
+        startIndex: clampToOverlay(selection.startIndex),
+        endIndex: clampToOverlay(selection.endIndex),
+      };
+      // Keep a single cursor source of truth: the moving edge of the selection.
+      const cursorIndex = clampToOverlay(effectiveSelection.endIndex);
+
       pendingComposerHunkSwitchRef.current = null;
 
-      // Resolve which hunk to attach the composer to. If the cursor has moved
-      // into a different hunk (e.g. via arrow-key line navigation), look it up
-      // from the overlay's lineHunkIds rather than using the stale selectedHunk.
-      let targetHunk = selectedHunk;
-      let targetRange = selectedHunkRange;
-      let targetSelectionEnd = selection?.endIndex ?? null;
-
-      if (selection && (!targetRange || !isSelectionInsideRange(selection, targetRange))) {
-        const resolved = findHunkAtLine(selection.endIndex, overlayData, currentFileHunks);
-        if (resolved) {
-          targetHunk = resolved.hunk;
-          targetRange = resolved.range;
-          targetSelectionEnd = Math.max(
-            resolved.range.startIndex,
-            Math.min(resolved.range.endIndex, selection.endIndex)
-          );
-          // Keep cursor state anchored to the intended target line before
-          // hunk-selection effects run; this avoids snapping to hunk start.
-          setActiveLineIndex(targetSelectionEnd);
-
-          const currentSelectedHunkId = selectedHunkIdRef.current;
-          if (resolved.hunk.id !== currentSelectedHunkId) {
-            // Record the in-flight hunk switch so mismatch guards do not clear
-            // this composer request before onSelectHunk propagates.
-            pendingJumpSelectAllHunkIdRef.current = null;
-            pendingComposerHunkSwitchRef.current = {
-              fromHunkId: currentSelectedHunkId,
-              toHunkId: resolved.hunk.id,
-            };
-            onSelectHunk(resolved.hunk.id);
-          }
-        }
-      }
-
-      if (!targetHunk || !targetRange) {
+      const resolvedTarget =
+        findHunkAtLine(cursorIndex, overlayData, currentFileHunks) ??
+        findHunkAtLine(effectiveSelection.startIndex, overlayData, currentFileHunks);
+      const targetHunk = resolvedTarget?.hunk ?? selectedHunk;
+      if (!targetHunk) {
         return;
       }
 
-      const fallbackLineIndex =
-        targetSelectionEnd === null
-          ? targetRange.startIndex
-          : Math.max(targetRange.startIndex, Math.min(targetRange.endIndex, targetSelectionEnd));
+      const currentSelectedHunkId = selectedHunkIdRef.current;
+      if (targetHunk.id !== currentSelectedHunkId) {
+        // Record the in-flight hunk switch so mismatch guards do not clear
+        // this composer request before onSelectHunk propagates.
+        pendingJumpSelectAllHunkIdRef.current = null;
+        pendingComposerHunkSwitchRef.current = {
+          fromHunkId: currentSelectedHunkId,
+          toHunkId: targetHunk.id,
+        };
+        onSelectHunk(targetHunk.id);
+      }
 
-      const effectiveSelection =
-        selection && isSelectionInsideRange(selection, targetRange)
-          ? selection
-          : {
-              startIndex: fallbackLineIndex,
-              endIndex: fallbackLineIndex,
-            };
+      // Keep the keyboard cursor on the last selected line so comment placement,
+      // selection visuals, and subsequent actions all share the same anchor.
+      setActiveLineIndex(cursorIndex);
 
       nextComposerRequestIdRef.current += 1;
       setInlineComposerRequest({
         requestId: nextComposerRequestIdRef.current,
         prefill,
         hunkId: targetHunk.id,
-        startOffset: effectiveSelection.startIndex - targetRange.startIndex,
-        endOffset: effectiveSelection.endIndex - targetRange.startIndex,
+        startIndex: effectiveSelection.startIndex,
+        endIndex: effectiveSelection.endIndex,
+        cursorIndex,
       });
     },
-    [
-      getCurrentLineSelection,
-      selectedHunk,
-      selectedHunkRange,
-      overlayData,
-      currentFileHunks,
-      onSelectHunk,
-    ]
+    [getCurrentLineSelection, selectedHunk, overlayData, currentFileHunks, onSelectHunk]
   );
 
   const handleReviewNoteSubmit = useCallback(
@@ -1006,6 +1056,9 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       // still keep an external selection request active. Clear it to close the composer
       // and prevent accidental duplicate submissions on repeated Enter presses.
       setInlineComposerRequest(null);
+      // Clear the line selection so the next Shift+C targets the current keyboard
+      // cursor (activeLineIndex) rather than the stale range from this comment.
+      setSelectedLineRange(null);
       containerRef.current?.focus();
     },
     [onReviewNote]
@@ -1015,6 +1068,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     // Keep immersive parent state aligned with child composer teardown so canceled
     // keyboard-initiated requests do not linger or steal focus.
     setInlineComposerRequest(null);
+    setSelectedLineRange(null);
     containerRef.current?.focus();
   }, []);
 
@@ -1043,7 +1097,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         onSelectHunk(lineHunkId);
       }
     },
-    [overlayData.lineHunkIds, selectedHunkRange?.startIndex, onSelectHunk]
+    [overlayData.lineHunkIds, selectedHunkRange, onSelectHunk]
   );
 
   const handleLineIndexSelect = useCallback(
@@ -1057,12 +1111,20 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       const anchorIndex = shiftKey
         ? (selectedLineRangeRef.current?.startIndex ?? activeLineIndexRef.current ?? lineIndex)
         : lineIndex;
-      setActiveLineIndex(lineIndex);
+      setActiveLineIndex((previousLineIndex) =>
+        previousLineIndex === lineIndex ? previousLineIndex : lineIndex
+      );
 
       if (shiftKey) {
-        setSelectedLineRange({ startIndex: anchorIndex, endIndex: lineIndex });
+        setSelectedLineRange((previousRange) => {
+          if (previousRange?.startIndex === anchorIndex && previousRange?.endIndex === lineIndex) {
+            return previousRange;
+          }
+
+          return { startIndex: anchorIndex, endIndex: lineIndex };
+        });
       } else {
-        setSelectedLineRange(null);
+        setSelectedLineRange((previousRange) => (previousRange === null ? previousRange : null));
       }
 
       if (isTouchExperience && !shiftKey && resolvedHunk) {
@@ -1354,29 +1416,9 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       return;
     }
 
-    const normalizedSelectedLineRange = selectedLineRange
-      ? {
-          startIndex: Math.min(selectedLineRange.startIndex, selectedLineRange.endIndex),
-          endIndex: Math.max(selectedLineRange.startIndex, selectedLineRange.endIndex),
-        }
-      : null;
-    const hasMultiLineSelection = Boolean(
-      normalizedSelectedLineRange &&
-      normalizedSelectedLineRange.endIndex > normalizedSelectedLineRange.startIndex
-    );
-    const isActiveLineInsideSelection = Boolean(
-      normalizedSelectedLineRange &&
-      activeLineIndex !== null &&
-      activeLineIndex >= normalizedSelectedLineRange.startIndex &&
-      activeLineIndex <= normalizedSelectedLineRange.endIndex
-    );
     const shouldRenderActiveLineOutline =
-      activeLineIndex !== null &&
-      lineIndexForScroll === activeLineIndex &&
-      !(hasMultiLineSelection && isActiveLineInsideSelection);
+      activeLineIndex !== null && lineIndexForScroll === activeLineIndex;
 
-    // For full-hunk keyboard selections (J/K), suppress the separate active-line
-    // ring so the range highlight reads as one unified selection.
     if (shouldRenderActiveLineOutline) {
       lineElement.style.outline = ACTIVE_LINE_OUTLINE;
       lineElement.style.outlineOffset = "-1px";
@@ -1410,7 +1452,6 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     overlayData.content,
     revealTargetLineIndex,
     scrollNonce,
-    selectedLineRange,
   ]);
 
   useEffect(() => {
@@ -1445,7 +1486,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
   }, [selectedLineSummary, selectedHunkRange]);
 
   const externalComposerSelectionRequest = useMemo(() => {
-    if (!inlineComposerRequest || !selectedHunk || !selectedHunkRange) {
+    if (!inlineComposerRequest || !selectedHunk) {
       return null;
     }
 
@@ -1453,18 +1494,23 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       return null;
     }
 
-    const clampToHunk = (lineIndex: number) =>
-      Math.max(selectedHunkRange.startIndex, Math.min(selectedHunkRange.endIndex, lineIndex));
+    const lineCount = overlayData.lineHunkIds.length;
+    if (lineCount === 0) {
+      return null;
+    }
+
+    const clampToOverlay = (lineIndex: number) => Math.max(0, Math.min(lineCount - 1, lineIndex));
 
     return {
       requestId: inlineComposerRequest.requestId,
       selection: {
-        startIndex: clampToHunk(selectedHunkRange.startIndex + inlineComposerRequest.startOffset),
-        endIndex: clampToHunk(selectedHunkRange.startIndex + inlineComposerRequest.endOffset),
+        startIndex: clampToOverlay(inlineComposerRequest.startIndex),
+        endIndex: clampToOverlay(inlineComposerRequest.endIndex),
       },
+      composerAfterIndex: clampToOverlay(inlineComposerRequest.cursorIndex),
       initialNoteText: inlineComposerRequest.prefill,
     };
-  }, [inlineComposerRequest, selectedHunk, selectedHunkRange]);
+  }, [inlineComposerRequest, overlayData.lineHunkIds.length, selectedHunk]);
 
   const shouldEnableHighlighting = overlayData.lineHunkIds.length <= MAX_HIGHLIGHTED_DIFF_LINES;
 
@@ -1586,7 +1632,10 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
       {/* Unified whole-file diff with hunk overlays + notes sidebar */}
       <div className="flex min-h-0 flex-1">
-        <div ref={scrollContainerRef} className="min-h-0 min-w-0 flex-1 overflow-y-auto p-3">
+        <div
+          ref={scrollContainerRef}
+          className="scrollbar-none min-h-0 min-w-0 flex-1 overflow-y-auto py-3"
+        >
           {props.isLoading && currentFileHunks.length === 0 ? (
             <div className="text-muted flex items-center justify-center py-12 text-sm">
               <span className="animate-pulse">Loading diff...</span>
@@ -1596,7 +1645,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
               {activeFilePath ? "No hunks for this file" : "No files to review"}
             </div>
           ) : (
-            <div className="border-border-light bg-dark relative overflow-hidden rounded border">
+            <div className="bg-dark relative overflow-hidden">
               {shouldShowFileTransitionSplash && (
                 <div className="bg-dark/95 text-muted absolute inset-0 z-10 flex items-center justify-center text-sm">
                   <span className="animate-pulse">Loading file...</span>
@@ -1634,6 +1683,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
             scrollContainerRef={scrollContainerRef}
             activeLineIndex={activeLineIndex}
             onSelectLineIndex={handleMinimapSelectLine}
+            commentLineIndices={commentLineIndices}
           />
         )}
 

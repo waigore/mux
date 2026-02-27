@@ -4,6 +4,8 @@ import * as path from "node:path";
 import { Worker } from "node:worker_threads";
 import type {
   AgentCostRow,
+  DelegationAgentBreakdownRow,
+  DelegationSummaryTotalsRow,
   HistogramBucket,
   ProviderCacheHitModelRow,
   SpendByModelRow,
@@ -52,7 +54,8 @@ type AnalyticsQueryName =
   | "getTokensByModel"
   | "getTimingDistribution"
   | "getAgentCostBreakdown"
-  | "getCacheHitRatioByProvider";
+  | "getCacheHitRatioByProvider"
+  | "getDelegationSummary";
 
 interface IngestWorkspaceMeta {
   projectPath: string | undefined;
@@ -77,21 +80,18 @@ interface TimingDistributionRow {
   histogram: HistogramBucket[];
 }
 
-interface RebuildAllResult {
-  workspacesIngested: number;
+interface DelegationSummaryQueryResult {
+  totals: DelegationSummaryTotalsRow;
+  breakdown: DelegationAgentBreakdownRow[];
 }
 
-interface NeedsBackfillResult {
-  needsBackfill: boolean;
+interface RebuildAllResult {
+  workspacesIngested: number;
 }
 
 interface RebuildAllData {
   sessionsDir: string;
   workspaceMetaById: Record<string, IngestWorkspaceMeta>;
-}
-
-interface NeedsBackfillData {
-  sessionsDir: string;
 }
 
 function toOptionalNonEmptyString(value: string | undefined): string | undefined {
@@ -339,30 +339,18 @@ export class AnalyticsService {
     const dbPath = path.join(dbDir, "analytics.db");
     await this.dispatch("init", { dbPath });
 
-    const backfillState = await this.dispatch<NeedsBackfillResult>("needsBackfill", {
-      sessionsDir: this.config.sessionsDir,
-    } satisfies NeedsBackfillData);
-    assert(
-      typeof backfillState.needsBackfill === "boolean",
-      "Analytics worker needsBackfill task must return a boolean"
-    );
-
-    if (!backfillState.needsBackfill) {
-      return;
-    }
-
-    // Backfill existing workspace history when analytics initialization is
-    // missing or appears partial (for example, when any session workspace lacks
-    // a matching watermark row, even if stale watermark rows keep counts equal).
-    // Once every session workspace has a watermark row, routine worker restarts
-    // skip full rebuilds, including zero-event histories. Awaited so the first
-    // query sees complete data instead of an empty/partially-rebuilt database.
+    // Sync analytics state with on-disk workspace history when worker starts.
+    // Worker decides whether this is a noop, incremental sync, or full rebuild.
+    // Awaited so first query observes complete startup state.
     try {
-      await this.dispatch("rebuildAll", this.buildRebuildAllData());
+      await this.dispatch("syncCheck", {
+        sessionsDir: this.config.sessionsDir,
+        workspaceMetaById: this.buildRebuildWorkspaceMetaById(),
+      });
     } catch (error) {
-      // Non-fatal: queries will work but may show partial historical data
+      // Non-fatal: queries still work but may show partial historical data
       // until incremental stream-end ingestion fills gaps.
-      log.warn("[AnalyticsService] Initial backfill failed (non-fatal)", {
+      log.warn("[AnalyticsService] Initial sync check failed (non-fatal)", {
         error: getErrorMessage(error),
       });
     }
@@ -608,6 +596,52 @@ export class AnalyticsService {
     });
 
     return aggregateProviderCacheHitRows(rows);
+  }
+
+  async getDelegationSummary(
+    projectPath: string | null,
+    from?: Date | null,
+    to?: Date | null
+  ): Promise<{
+    totalChildren: number;
+    totalTokensConsumed: number;
+    totalReportTokens: number;
+    compressionRatio: number;
+    totalCostDelegated: number;
+    byAgentType: Array<{
+      agentType: string;
+      count: number;
+      totalTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      reasoningTokens: number;
+      cachedTokens: number;
+      cacheCreateTokens: number;
+    }>;
+  }> {
+    const result = await this.executeQuery<DelegationSummaryQueryResult>("getDelegationSummary", {
+      projectPath,
+      from: toDateFilterString(from),
+      to: toDateFilterString(to),
+    });
+
+    return {
+      totalChildren: result.totals.total_children,
+      totalTokensConsumed: result.totals.total_tokens_consumed,
+      totalReportTokens: result.totals.total_report_tokens,
+      compressionRatio: result.totals.compression_ratio,
+      totalCostDelegated: result.totals.total_cost_delegated,
+      byAgentType: result.breakdown.map((row) => ({
+        agentType: row.agent_type,
+        count: row.delegation_count,
+        totalTokens: row.total_tokens,
+        inputTokens: row.input_tokens,
+        outputTokens: row.output_tokens,
+        reasoningTokens: row.reasoning_tokens,
+        cachedTokens: row.cached_tokens,
+        cacheCreateTokens: row.cache_create_tokens,
+      })),
+    };
   }
 
   async rebuildAll(): Promise<{ success: boolean; workspacesIngested: number }> {

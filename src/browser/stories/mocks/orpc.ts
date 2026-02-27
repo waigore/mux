@@ -884,6 +884,52 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           },
         }),
     },
+    analytics: {
+      getDelegationSummary: (_input: {
+        projectPath?: string | null;
+        from?: Date | null;
+        to?: Date | null;
+      }) =>
+        Promise.resolve({
+          totalChildren: 142,
+          totalTokensConsumed: 1_900_000,
+          totalReportTokens: 210_000,
+          compressionRatio: 9.05,
+          totalCostDelegated: 37.42,
+          byAgentType: [
+            {
+              agentType: "explore",
+              count: 48,
+              totalTokens: 640_000,
+              inputTokens: 330_000,
+              outputTokens: 220_000,
+              reasoningTokens: 50_000,
+              cachedTokens: 30_000,
+              cacheCreateTokens: 10_000,
+            },
+            {
+              agentType: "exec",
+              count: 71,
+              totalTokens: 1_010_000,
+              inputTokens: 500_000,
+              outputTokens: 350_000,
+              reasoningTokens: 100_000,
+              cachedTokens: 45_000,
+              cacheCreateTokens: 15_000,
+            },
+            {
+              agentType: "plan",
+              count: 23,
+              totalTokens: 250_000,
+              inputTokens: 130_000,
+              outputTokens: 75_000,
+              reasoningTokens: 25_000,
+              cachedTokens: 15_000,
+              cacheCreateTokens: 5_000,
+            },
+          ],
+        }),
+    },
     general: {
       listDirectory: () => Promise.resolve({ entries: [], hasMore: false }),
       ping: (input: string) => Promise.resolve(`Pong: ${input}`),
@@ -1326,6 +1372,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }),
       getSubagentTranscript: (input: { workspaceId?: string; taskId: string }) =>
         Promise.resolve(subagentTranscripts.get(input.taskId) ?? { messages: [] }),
+      getPostCompactionState: () =>
+        Promise.resolve({ planPath: null, trackedFilePaths: [], excludedItems: [] }),
+      setPostCompactionExclusion: () =>
+        Promise.resolve({ success: true as const, data: undefined }),
       executeBash: async (input: { workspaceId: string; script: string }) => {
         if (executeBash) {
           const result = await executeBash(input.workspaceId, input.script);
@@ -1420,7 +1470,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       mcp: {
         get: (input: { workspaceId: string }) =>
           Promise.resolve(mcpOverrides.get(input.workspaceId) ?? {}),
-        set: () => Promise.resolve({ success: true, data: undefined }),
+        set: (input: { workspaceId: string; overrides: MockMcpOverrides }) => {
+          mcpOverrides.set(input.workspaceId, input.overrides);
+          return Promise.resolve({ success: true, data: undefined });
+        },
       },
       getFileCompletions: (input: { workspaceId: string; query: string; limit?: number }) => {
         // Mock file paths for storybook - simulate typical project structure

@@ -89,3 +89,95 @@ export const scrollTopForLine = (
 
   return ratio * maxScroll;
 };
+
+/**
+ * Build a mapping from new-side line numbers to minimap (diff) line indices.
+ * Hunk headers (`@@` lines) are skipped to stay aligned with parseDiffLines output.
+ * Used to position review comment indicators on the minimap.
+ */
+export const buildNewLineNumberToIndexMap = (content: string): Map<number, number> => {
+  if (content.length === 0) return new Map();
+
+  const lines = content.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+
+  const map = new Map<number, number>();
+  let diffIndex = 0;
+  let newLineNum = 0;
+
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      const match = /\+(\d+)/.exec(line);
+      if (match) newLineNum = Number(match[1]) - 1;
+      continue;
+    }
+
+    if (line.startsWith("-")) {
+      // Old-only line; no new line number
+      diffIndex++;
+      continue;
+    }
+
+    if (line.startsWith("+")) {
+      newLineNum++;
+      map.set(newLineNum, diffIndex);
+      diffIndex++;
+      continue;
+    }
+
+    // Context line — exists in both old and new
+    newLineNum++;
+    map.set(newLineNum, diffIndex);
+    diffIndex++;
+  }
+
+  return map;
+};
+
+/**
+ * Build a mapping from old-side line numbers to minimap (diff) line indices.
+ * Hunk headers (`@@` lines) are skipped to stay aligned with parseDiffLines output.
+ * Used to position review comment indicators on the minimap.
+ */
+export const buildOldLineNumberToIndexMap = (content: string): Map<number, number> => {
+  if (content.length === 0) return new Map();
+
+  const lines = content.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+
+  const map = new Map<number, number>();
+  let diffIndex = 0;
+  let oldLineNum = 0;
+
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      const match = /-(\d+)/.exec(line);
+      if (match) oldLineNum = Number(match[1]) - 1;
+      continue;
+    }
+
+    if (line.startsWith("+")) {
+      // New-only line; no old line number
+      diffIndex++;
+      continue;
+    }
+
+    if (line.startsWith("-")) {
+      oldLineNum++;
+      map.set(oldLineNum, diffIndex);
+      diffIndex++;
+      continue;
+    }
+
+    // Context line — exists in both old and new
+    oldLineNum++;
+    map.set(oldLineNum, diffIndex);
+    diffIndex++;
+  }
+
+  return map;
+};

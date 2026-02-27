@@ -8,6 +8,7 @@
 import type { APIClient } from "@/browser/contexts/API";
 import type {
   AgentCostItem,
+  DelegationSummary,
   ProviderCacheHitRatioItem,
   SpendByModelItem,
   SpendByProjectItem,
@@ -58,6 +59,11 @@ interface StoryAnalyticsNamespace {
     from?: Date | null;
     to?: Date | null;
   }) => Promise<ProviderCacheHitRatioItem[]>;
+  getDelegationSummary: (input: {
+    projectPath?: string | null;
+    from?: Date | null;
+    to?: Date | null;
+  }) => Promise<DelegationSummary>;
   rebuildDatabase: (_input: Record<string, never>) => Promise<{
     success: boolean;
     workspacesIngested: number;
@@ -436,6 +442,219 @@ const PROVIDER_CACHE_HIT_SCALING: Record<
   [PROJECT_PATHS.docs]: { ratioScale: 0.82, responseScale: 0.2 },
 };
 
+const DELEGATION_SUMMARY_BY_PROJECT = new Map<AnalyticsProjectPath | null, DelegationSummary>([
+  [
+    null,
+    {
+      totalChildren: 286,
+      totalTokensConsumed: 2_710_000,
+      totalReportTokens: 296_000,
+      compressionRatio: 9.2,
+      totalCostDelegated: 58.34,
+      byAgentType: [
+        {
+          agentType: "explore",
+          count: 108,
+          totalTokens: 870_000,
+          inputTokens: 430_000,
+          outputTokens: 300_000,
+          reasoningTokens: 90_000,
+          cachedTokens: 40_000,
+          cacheCreateTokens: 10_000,
+        },
+        {
+          agentType: "exec",
+          count: 136,
+          totalTokens: 1_430_000,
+          inputTokens: 700_000,
+          outputTokens: 500_000,
+          reasoningTokens: 150_000,
+          cachedTokens: 60_000,
+          cacheCreateTokens: 20_000,
+        },
+        {
+          agentType: "plan",
+          count: 42,
+          totalTokens: 410_000,
+          inputTokens: 210_000,
+          outputTokens: 120_000,
+          reasoningTokens: 50_000,
+          cachedTokens: 20_000,
+          cacheCreateTokens: 10_000,
+        },
+      ],
+    },
+  ],
+  [
+    PROJECT_PATHS.atlas,
+    {
+      totalChildren: 144,
+      totalTokensConsumed: 1_410_000,
+      totalReportTokens: 150_000,
+      compressionRatio: 9.4,
+      totalCostDelegated: 31.12,
+      byAgentType: [
+        {
+          agentType: "explore",
+          count: 56,
+          totalTokens: 440_000,
+          inputTokens: 220_000,
+          outputTokens: 150_000,
+          reasoningTokens: 40_000,
+          cachedTokens: 20_000,
+          cacheCreateTokens: 10_000,
+        },
+        {
+          agentType: "exec",
+          count: 69,
+          totalTokens: 760_000,
+          inputTokens: 360_000,
+          outputTokens: 280_000,
+          reasoningTokens: 70_000,
+          cachedTokens: 35_000,
+          cacheCreateTokens: 15_000,
+        },
+        {
+          agentType: "plan",
+          count: 19,
+          totalTokens: 210_000,
+          inputTokens: 110_000,
+          outputTokens: 60_000,
+          reasoningTokens: 20_000,
+          cachedTokens: 15_000,
+          cacheCreateTokens: 5_000,
+        },
+      ],
+    },
+  ],
+  [
+    PROJECT_PATHS.orbit,
+    {
+      totalChildren: 96,
+      totalTokensConsumed: 935_000,
+      totalReportTokens: 107_000,
+      compressionRatio: 8.7,
+      totalCostDelegated: 19.57,
+      byAgentType: [
+        {
+          agentType: "explore",
+          count: 33,
+          totalTokens: 300_000,
+          inputTokens: 150_000,
+          outputTokens: 100_000,
+          reasoningTokens: 30_000,
+          cachedTokens: 15_000,
+          cacheCreateTokens: 5_000,
+        },
+        {
+          agentType: "exec",
+          count: 48,
+          totalTokens: 490_000,
+          inputTokens: 240_000,
+          outputTokens: 170_000,
+          reasoningTokens: 45_000,
+          cachedTokens: 25_000,
+          cacheCreateTokens: 10_000,
+        },
+        {
+          agentType: "plan",
+          count: 15,
+          totalTokens: 145_000,
+          inputTokens: 70_000,
+          outputTokens: 45_000,
+          reasoningTokens: 15_000,
+          cachedTokens: 10_000,
+          cacheCreateTokens: 5_000,
+        },
+      ],
+    },
+  ],
+  [
+    PROJECT_PATHS.docs,
+    {
+      totalChildren: 46,
+      totalTokensConsumed: 365_000,
+      totalReportTokens: 39_000,
+      compressionRatio: 9.4,
+      totalCostDelegated: 7.65,
+      byAgentType: [
+        {
+          agentType: "explore",
+          count: 19,
+          totalTokens: 130_000,
+          inputTokens: 65_000,
+          outputTokens: 40_000,
+          reasoningTokens: 15_000,
+          cachedTokens: 7_000,
+          cacheCreateTokens: 3_000,
+        },
+        {
+          agentType: "exec",
+          count: 19,
+          totalTokens: 180_000,
+          inputTokens: 85_000,
+          outputTokens: 60_000,
+          reasoningTokens: 20_000,
+          cachedTokens: 10_000,
+          cacheCreateTokens: 5_000,
+        },
+        {
+          agentType: "plan",
+          count: 8,
+          totalTokens: 55_000,
+          inputTokens: 25_000,
+          outputTokens: 18_000,
+          reasoningTokens: 7_000,
+          cachedTokens: 3_000,
+          cacheCreateTokens: 2_000,
+        },
+      ],
+    },
+  ],
+]);
+
+for (const [projectPath, summary] of DELEGATION_SUMMARY_BY_PROJECT.entries()) {
+  const childCountByAgentType = summary.byAgentType.reduce(
+    (total, breakdown) => total + breakdown.count,
+    0
+  );
+  assert(
+    childCountByAgentType === summary.totalChildren,
+    `Delegation fixture child counts must sum to totalChildren for ${projectPath ?? "all"}`
+  );
+
+  const tokenCountByAgentType = summary.byAgentType.reduce(
+    (total, breakdown) => total + breakdown.totalTokens,
+    0
+  );
+  assert(
+    tokenCountByAgentType === summary.totalTokensConsumed,
+    `Delegation fixture token counts must sum to totalTokensConsumed for ${projectPath ?? "all"}`
+  );
+
+  for (const breakdown of summary.byAgentType) {
+    const tokenTotal =
+      breakdown.inputTokens +
+      breakdown.cachedTokens +
+      breakdown.cacheCreateTokens +
+      breakdown.outputTokens +
+      breakdown.reasoningTokens;
+
+    assert(
+      tokenTotal === breakdown.totalTokens,
+      `Delegation fixture token categories must sum to totalTokens for ${projectPath ?? "all"} (${breakdown.agentType})`
+    );
+  }
+
+  const expectedCompressionRatio = Number(
+    (summary.totalTokensConsumed / Math.max(1, summary.totalReportTokens)).toFixed(1)
+  );
+  assert(
+    Math.abs(summary.compressionRatio - expectedCompressionRatio) <= 0.1,
+    `Delegation fixture compressionRatio must match derived ratio for ${projectPath ?? "all"}`
+  );
+}
+
 function normalizeProjectPath(projectPath: string | null | undefined): AnalyticsProjectPath | null {
   if (projectPath == null) {
     return null;
@@ -668,6 +887,17 @@ function setupAnalyticsStory(): APIClient {
     getCacheHitRatioByProvider: (input) => {
       const projectPath = normalizeProjectPath(input.projectPath ?? null);
       return Promise.resolve(getProviderCacheHitRatios(projectPath));
+    },
+    getDelegationSummary: (input) => {
+      const projectPath = normalizeProjectPath(input.projectPath ?? null);
+      const summary = DELEGATION_SUMMARY_BY_PROJECT.get(projectPath);
+
+      assert(
+        summary != null,
+        `Missing delegation summary fixture for scope ${projectPath ?? "all"}`
+      );
+
+      return Promise.resolve(summary);
     },
     rebuildDatabase: () =>
       Promise.resolve({

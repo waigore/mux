@@ -557,6 +557,17 @@ export class ProviderModelFactory {
       const configAnthropicCacheTtl = parseAnthropicCacheTtl(providersConfig.anthropic?.cacheTtl);
       const isAnthropicRoutedModel =
         providerName === "anthropic" || modelId.startsWith("anthropic/");
+
+      // Anthropic-specific: merge global disableBetaFeatures into muxProviderOptions.
+      const configDisableBeta = providersConfig.anthropic?.disableBetaFeatures;
+      if (isAnthropicRoutedModel && configDisableBeta === true) {
+        muxProviderOptions ??= {};
+        muxProviderOptions.anthropic = {
+          ...(muxProviderOptions.anthropic ?? {}),
+          disableBetaFeatures: muxProviderOptions.anthropic?.disableBetaFeatures ?? true,
+        };
+      }
+
       if (isAnthropicRoutedModel && configAnthropicCacheTtl && muxProviderOptions) {
         muxProviderOptions.anthropic = {
           ...(muxProviderOptions.anthropic ?? {}),
@@ -565,6 +576,17 @@ export class ProviderModelFactory {
       }
       const effectiveAnthropicCacheTtl =
         muxProviderOptions?.anthropic?.cacheTtl ?? configAnthropicCacheTtl;
+
+      // OpenAI-specific: merge global store setting into muxProviderOptions.
+      const isOpenAIRoutedModel = providerName === "openai" || modelId.startsWith("openai/");
+      const configOpenAIStore = providersConfig.openai?.store;
+      if (isOpenAIRoutedModel && typeof configOpenAIStore === "boolean") {
+        muxProviderOptions ??= {};
+        muxProviderOptions.openai = {
+          ...(muxProviderOptions.openai ?? {}),
+          store: muxProviderOptions.openai?.store ?? configOpenAIStore,
+        };
+      }
 
       let providerConfig = providersConfig[providerName] ?? {};
 
@@ -626,10 +648,10 @@ export class ProviderModelFactory {
         // (SDK doesn't translate providerOptions to cache_control for these)
         // Use getProviderFetch to preserve any user-configured custom fetch (e.g., proxies)
         const baseFetch = getProviderFetch(providerConfig);
-        const fetchWithCacheControl = wrapFetchWithAnthropicCacheControl(
-          baseFetch,
-          effectiveAnthropicCacheTtl
-        );
+        const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+        const fetchWithCacheControl = disableBeta
+          ? baseFetch
+          : wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl);
         const provider = createAnthropic({
           ...normalizedConfig,
           fetch: fetchWithCacheControl,
@@ -689,6 +711,20 @@ export class ProviderModelFactory {
           return Err({ type: "api_key_not_found", provider: providerName });
         }
 
+        // chatCompletions mode requires a real API key — Codex OAuth only supports
+        // the Responses API endpoint. Block early with a clear error instead of
+        // sending requests with the "codex-oauth" placeholder key.
+        const earlyWireFormat =
+          (providerConfig.wireFormat as string | undefined) ??
+          muxProviderOptions?.openai?.wireFormat;
+        if (
+          shouldRouteThroughCodexOauth &&
+          earlyWireFormat === "chatCompletions" &&
+          !creds.isConfigured
+        ) {
+          return Err({ type: "api_key_not_found", provider: providerName });
+        }
+
         // Merge resolved credentials into config
         const configWithCreds = {
           ...providerConfig,
@@ -699,14 +735,30 @@ export class ProviderModelFactory {
           ...(creds.organization && { organization: creds.organization }),
         };
 
-        // Extract serviceTier from config to pass through to buildProviderOptions
+        // Extract serviceTier and wireFormat from config to pass through to buildProviderOptions.
+        // Initialize muxProviderOptions if absent so config values aren't silently dropped
+        // when call sites omit options (e.g. TaskService, WorkspaceTitleGenerator).
         const configServiceTier = providerConfig.serviceTier as string | undefined;
-        if (configServiceTier && muxProviderOptions) {
-          muxProviderOptions.openai = {
-            ...muxProviderOptions.openai,
-            serviceTier: configServiceTier as "auto" | "default" | "flex" | "priority",
-          };
+        const configWireFormat = providerConfig.wireFormat as string | undefined;
+        if (configServiceTier || configWireFormat) {
+          muxProviderOptions ??= {};
+          if (configServiceTier) {
+            muxProviderOptions.openai = {
+              ...muxProviderOptions.openai,
+              serviceTier: configServiceTier as "auto" | "default" | "flex" | "priority",
+            };
+          }
+          if (configWireFormat === "responses" || configWireFormat === "chatCompletions") {
+            muxProviderOptions.openai = {
+              ...muxProviderOptions.openai,
+              wireFormat: configWireFormat,
+            };
+          }
         }
+
+        // Resolve effective wireFormat once — used by both fetch wrapper and model selection.
+        // Includes request-level overrides from muxProviderOptions, not just config.
+        const effectiveWireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
 
         const baseFetch = getProviderFetch(providerConfig);
         const codexOauthService = this.codexOauthService;
@@ -859,7 +911,11 @@ export class ProviderModelFactory {
                 }
               }
 
-              if (shouldRouteThroughCodexOauth && (isOpenAIResponses || isOpenAIChatCompletions)) {
+              if (
+                shouldRouteThroughCodexOauth &&
+                effectiveWireFormat !== "chatCompletions" &&
+                (isOpenAIResponses || isOpenAIChatCompletions)
+              ) {
                 if (!codexOauthService) {
                   throw new Error("Codex OAuth service not initialized");
                 }
@@ -904,17 +960,15 @@ export class ProviderModelFactory {
           // The preconnect method is optional in our implementation but required by the SDK type.
           fetch: fetchWithOpenAITruncation as typeof fetch,
         });
-        // Use Responses API for persistence and built-in tools
         // OpenAI manages reasoning state via previousResponseId - no middleware needed
-        const model = provider.responses(modelId);
-        if (shouldRouteThroughCodexOauth) {
-          markModelCostsIncluded(model);
+        const model =
+          effectiveWireFormat === "chatCompletions"
+            ? provider.chat(modelId)
+            : provider.responses(modelId);
+        const injectModelOpenAIStore = (storeValue: unknown, mode: "default" | "force"): void => {
+          assert(typeof storeValue === "boolean", "OpenAI store override must be boolean");
+          const store = storeValue;
 
-          // Wrap model to inject store=false into providerOptions so the SDK
-          // sends full inline content instead of item_reference lookups.
-          // The Codex endpoint requires store=false; without this, the SDK
-          // defaults to store=true and sends bare { type: "item_reference" }
-          // items that can't be resolved.
           const injectStoreFlag = (
             options: Parameters<typeof model.doStream>[0]
           ): Parameters<typeof model.doStream>[0] => {
@@ -924,10 +978,7 @@ export class ProviderModelFactory {
               ...options,
               providerOptions: {
                 ...options.providerOptions,
-                openai: {
-                  ...openaiOpts,
-                  store: false,
-                },
+                openai: mode === "force" ? { ...openaiOpts, store } : { store, ...openaiOpts },
               },
             };
           };
@@ -936,6 +987,23 @@ export class ProviderModelFactory {
           const originalDoGenerate = model.doGenerate.bind(model);
           model.doStream = (options) => originalDoStream(injectStoreFlag(options));
           model.doGenerate = (options) => originalDoGenerate(injectStoreFlag(options));
+        };
+
+        const configuredOpenAIStore = muxProviderOptions?.openai?.store;
+        if (typeof configuredOpenAIStore === "boolean") {
+          // Inject configured OpenAI store as a request-level default so callers
+          // that omit providerOptions still honor global ZDR settings.
+          injectModelOpenAIStore(configuredOpenAIStore, "default");
+        }
+
+        // Skip Codex OAuth routing for chatCompletions — the Codex endpoint
+        // only accepts Responses API format, so chat-completions requests would fail.
+        if (shouldRouteThroughCodexOauth && effectiveWireFormat !== "chatCompletions") {
+          markModelCostsIncluded(model);
+
+          // Codex OAuth requires store=false and must override any request-level
+          // setting to avoid unresolved item_reference lookups.
+          injectModelOpenAIStore(false, "force");
         }
         return Ok(model);
       }
@@ -1142,9 +1210,11 @@ export class ProviderModelFactory {
         // Use getProviderFetch to preserve any user-configured custom fetch (e.g., proxies)
         const baseFetch = getProviderFetch(providerConfig);
         const isAnthropicModel = modelId.startsWith("anthropic/");
-        const fetchWithCacheControl = isAnthropicModel
-          ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl)
-          : baseFetch;
+        const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+        const fetchWithCacheControl =
+          isAnthropicModel && !disableBeta
+            ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl)
+            : baseFetch;
         const fetchWithAutoLogout = wrapFetchWithMuxGatewayAutoLogout(
           fetchWithCacheControl,
           this.providerService
@@ -1187,6 +1257,33 @@ export class ProviderModelFactory {
           const result = await originalDoGenerate(options);
           return normalizeGatewayGenerateResult(result);
         };
+
+        const configuredOpenAIStore = muxProviderOptions?.openai?.store;
+        if (modelId.startsWith("openai/") && typeof configuredOpenAIStore === "boolean") {
+          // Inject configured OpenAI store as a request-level default for
+          // gateway-routed OpenAI models when callers omit providerOptions.
+          const injectStoreFlag = (
+            options: Parameters<typeof model.doStream>[0]
+          ): Parameters<typeof model.doStream>[0] => {
+            const openaiOpts =
+              (options.providerOptions?.openai as Record<string, unknown> | undefined) ?? {};
+            return {
+              ...options,
+              providerOptions: {
+                ...options.providerOptions,
+                openai: {
+                  store: configuredOpenAIStore,
+                  ...openaiOpts,
+                },
+              },
+            };
+          };
+
+          const originalDoStream = model.doStream.bind(model);
+          const originalDoGenerate = model.doGenerate.bind(model);
+          model.doStream = (options) => originalDoStream(injectStoreFlag(options));
+          model.doGenerate = (options) => originalDoGenerate(injectStoreFlag(options));
+        }
 
         return Ok(model);
       }

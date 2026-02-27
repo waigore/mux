@@ -97,8 +97,11 @@ export class ProviderService {
         apiKey?: string;
         baseUrl?: string;
         models?: unknown[];
-        serviceTier?: unknown;
+        serviceTier?: string;
+        wireFormat?: string;
+        store?: unknown;
         cacheTtl?: unknown;
+        disableBetaFeatures?: unknown;
         /** OpenAI-only: default auth precedence for Codex-OAuth-allowed models. */
         codexOauthDefaultAuth?: unknown;
         region?: string;
@@ -154,10 +157,29 @@ export class ProviderService {
         providerInfo.serviceTier = serviceTier;
       }
 
+      // OpenAI-specific: wire format (responses vs chatCompletions)
+      const wireFormat = config.wireFormat;
+      if (
+        provider === "openai" &&
+        (wireFormat === "responses" || wireFormat === "chatCompletions")
+      ) {
+        providerInfo.wireFormat = wireFormat;
+      }
+
+      // OpenAI-specific: response storage setting (required for ZDR)
+      if (provider === "openai" && typeof config.store === "boolean") {
+        providerInfo.store = config.store;
+      }
+
       // Anthropic-specific fields
       const cacheTtl = config.cacheTtl;
       if (provider === "anthropic" && (cacheTtl === "5m" || cacheTtl === "1h")) {
         providerInfo.cacheTtl = cacheTtl;
+      }
+
+      // Anthropic-specific: disable all beta features for ZDR orgs.
+      if (provider === "anthropic" && config.disableBetaFeatures === true) {
+        providerInfo.disableBetaFeatures = true;
       }
 
       if (provider === "openai") {
@@ -323,7 +345,11 @@ export class ProviderService {
     }
   }
 
-  public setConfig(provider: string, keyPath: string[], value: string): Result<void, string> {
+  public setConfig(
+    provider: string,
+    keyPath: string[],
+    value: string | boolean
+  ): Result<void, string> {
     try {
       // Load current providers config or create empty
       const providersConfig = this.config.loadProvidersConfig() ?? {};
@@ -369,7 +395,7 @@ export class ProviderService {
 
         if (isProviderEnabledToggle) {
           // Persist only `enabled: false` and delete on enable so providers.jsonc stays minimal.
-          if (value === "false") {
+          if (value === false || value === "false") {
             current[lastKey] = false;
           } else {
             delete current[lastKey];

@@ -47,7 +47,7 @@ type ProviderOptions =
   | Record<string, never>; // Empty object for unsupported providers
 
 const OPENAI_REASONING_SUMMARY_UNSUPPORTED_MODELS = new Set<string>([
-  // gpt-5.3-codex-spark rejects reasoning.summary with:
+  // Codex Spark rejects reasoning.summary with:
   // "Unsupported parameter: 'reasoning.summary' ...".
   "gpt-5.3-codex-spark",
 ]);
@@ -103,7 +103,8 @@ export function buildProviderOptions(
 
   // Build Anthropic-specific options
   if (provider === "anthropic") {
-    const cacheTtl = muxProviderOptions?.anthropic?.cacheTtl;
+    const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+    const cacheTtl = disableBeta ? undefined : muxProviderOptions?.anthropic?.cacheTtl;
     const cacheControl = cacheTtl ? { type: "ephemeral" as const, ttl: cacheTtl } : undefined;
 
     // Opus 4.5+ and Sonnet 4.6 use the effort parameter for reasoning control.
@@ -233,6 +234,9 @@ export function buildProviderOptions(
     const promptCacheKey = workspaceId ? `mux-v1-${workspaceId}` : undefined;
 
     const serviceTier = muxProviderOptions?.openai?.serviceTier ?? "auto";
+    const wireFormat = muxProviderOptions?.openai?.wireFormat ?? "responses";
+    const store = muxProviderOptions?.openai?.store;
+    const isResponses = wireFormat === "responses";
     const truncationMode = openaiTruncationMode ?? "disabled";
     const shouldSendReasoningSummary = supportsOpenAIReasoningSummary(modelName);
 
@@ -243,31 +247,38 @@ export function buildProviderOptions(
       previousResponseId,
       promptCacheKey,
       truncation: truncationMode,
+      wireFormat,
     });
 
     const options: ProviderOptions = {
       openai: {
         parallelToolCalls: true, // Always enable concurrent tool execution
         serviceTier,
-        // Default to disabled; allow auto truncation for compaction to avoid context errors
-        truncation: truncationMode,
-        // Stable prompt cache key to improve OpenAI cache hit rates
-        // See: https://sdk.vercel.ai/providers/ai-sdk-providers/openai#responses-models
-        ...(promptCacheKey && { promptCacheKey }),
+        ...(store != null && { store }), // ZDR: pass store flag through to OpenAI SDK
+        ...(isResponses && {
+          // Default to disabled; allow auto truncation for compaction to avoid context errors
+          truncation: truncationMode,
+          // Stable prompt cache key to improve OpenAI cache hit rates
+          // See: https://sdk.vercel.ai/providers/ai-sdk-providers/openai#responses-models
+          ...(promptCacheKey && { promptCacheKey }),
+        }),
         // Conditionally add reasoning configuration
         ...(reasoningEffort && {
           reasoningEffort,
-          ...(shouldSendReasoningSummary && {
-            reasoningSummary: "detailed", // Enable detailed reasoning summaries when the model supports it
+          ...(isResponses &&
+            shouldSendReasoningSummary && {
+              reasoningSummary: "detailed", // Enable detailed reasoning summaries when the model supports it
+            }),
+          ...(isResponses && {
+            // Include reasoning encrypted content to preserve reasoning context across conversation steps
+            // Required when using reasoning models (gpt-5, o3, o4-mini) with tool calls
+            // See: https://sdk.vercel.ai/providers/ai-sdk-providers/openai#responses-models
+            include: ["reasoning.encrypted_content"],
           }),
-          // Include reasoning encrypted content to preserve reasoning context across conversation steps
-          // Required when using reasoning models (gpt-5, o3, o4-mini) with tool calls
-          // See: https://sdk.vercel.ai/providers/ai-sdk-providers/openai#responses-models
-          include: ["reasoning.encrypted_content"],
         }),
         // Include previousResponseId for conversation persistence
         // OpenAI uses this to maintain reasoning state across turns
-        ...(previousResponseId && { previousResponseId }),
+        ...(isResponses && previousResponseId && { previousResponseId }),
       },
     };
     log.info("buildProviderOptions: Returning OpenAI options", options);
@@ -387,6 +398,9 @@ export function buildRequestHeaders(
   const [provider] = normalized.split(":", 2);
 
   if (provider !== "anthropic") return undefined;
+
+  // ZDR: skip all Anthropic beta headers when beta features are disabled.
+  if (muxProviderOptions?.anthropic?.disableBetaFeatures) return undefined;
 
   const is1MEnabled =
     ((muxProviderOptions?.anthropic?.use1MContextModels?.includes(normalized) ?? false) ||

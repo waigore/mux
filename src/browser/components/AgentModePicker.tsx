@@ -15,12 +15,7 @@ import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { cn } from "@/common/lib/utils";
 import { DocsLink } from "@/browser/components/DocsLink";
-import {
-  HelpIndicator,
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/browser/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/ui/tooltip";
 import { Button } from "@/browser/components/ui/button";
 import { Switch } from "@/browser/components/ui/switch";
 import {
@@ -89,27 +84,6 @@ export function formatAgentIdLabel(agentId: string): string {
 function normalizeAgentId(value: unknown): string {
   return typeof value === "string" && value.trim().length > 0 ? value.trim().toLowerCase() : "";
 }
-
-const AgentHelpTooltip: React.FC = () => (
-  <Tooltip>
-    <TooltipTrigger asChild>
-      <HelpIndicator>?</HelpIndicator>
-    </TooltipTrigger>
-    <TooltipContent align="center" className="max-w-80 whitespace-normal">
-      Selects an agent definition (system prompt + tool policy).
-      <br />
-      <br />
-      Open picker: {formatKeybind(KEYBINDS.TOGGLE_AGENT)}
-      <br />
-      Cycle agents: {formatKeybind(KEYBINDS.CYCLE_AGENT)}
-      <br />
-      Quick select: {formatNumberedKeybind(0).replace("1", "1-9")} (when open)
-      <br />
-      <br />
-      <DocsLink path="/agents">Learn more about agents</DocsLink>
-    </TooltipContent>
-  </Tooltip>
-);
 
 function resolveAgentOptions(agents: AgentDefinitionDescriptor[]): AgentOption[] {
   return sortAgentsStable(agents.filter((entry) => entry.uiSelectable));
@@ -270,9 +244,6 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
       e.preventDefault();
       e.stopPropagation();
 
-      // Don't allow numbered shortcuts to bypass Auto lock
-      if (isAuto) return;
-
       // Use selectableOptions so keybinds match the visible dropdown items
       if (index < selectableOptions.length) {
         const picked = selectableOptions[index];
@@ -285,7 +256,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
     // Use capture phase to intercept before other handlers
     window.addEventListener("keydown", handleGlobalKeyDown, true);
     return () => window.removeEventListener("keydown", handleGlobalKeyDown, true);
-  }, [isPickerOpen, isAuto, selectableOptions, handleSelectAgent]);
+  }, [isPickerOpen, selectableOptions, handleSelectAgent]);
 
   const handleDropdownKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Escape") {
@@ -296,9 +267,6 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
       closePicker();
       return;
     }
-
-    // Don't navigate agents list when auto is active
-    if (isAuto) return;
 
     if (e.key === "Enter") {
       // Only handle Enter for agent rows — don't intercept when focus is on
@@ -362,7 +330,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
             }}
             style={activeStyle}
             className={cn(
-              "text-foreground hover:bg-hover flex items-center gap-1.5 rounded-sm border-[0.5px] px-1.5 py-0.5 text-[11px] font-medium transition-all duration-150",
+              "text-foreground hover:bg-hover flex items-center gap-1.5 rounded-sm border-[0.5px] px-1.5 py-0.5 text-[11px] font-medium transition-[background-color] duration-150",
               activeClassName
             )}
           >
@@ -379,18 +347,20 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
             />
           </Button>
         </TooltipTrigger>
-        <TooltipContent align="center">
-          Select agent{" "}
-          <span className="mobile-hide-shortcut-hints">
-            ({formatKeybind(KEYBINDS.TOGGLE_AGENT)})
-          </span>
+        <TooltipContent align="start" className="max-w-80 whitespace-normal">
+          Selects an agent definition (system prompt + tool policy).
+          <br />
+          <br />
+          Open picker: {formatKeybind(KEYBINDS.TOGGLE_AGENT)}
+          <br />
+          Cycle agents: {formatKeybind(KEYBINDS.CYCLE_AGENT)}
+          <br />
+          Quick select: {formatNumberedKeybind(0).replace("1", "1-9")} (when open)
+          <br />
+          <br />
+          <DocsLink path="/agents">Learn more about agents</DocsLink>
         </TooltipContent>
       </Tooltip>
-
-      {/* Tooltip is hover-only; hide it on touch + narrow layouts to avoid overlap. */}
-      <div className="hidden [@container(min-width:420px)]:[@media(hover:hover)_and_(pointer:fine)]:block">
-        <AgentHelpTooltip />
-      </div>
 
       {isPickerOpen && (
         <div
@@ -399,20 +369,15 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
           onKeyDown={handleDropdownKeyDown}
           className="bg-separator border-border-light absolute right-0 bottom-full z-[1020] mb-1 min-w-52 overflow-hidden rounded border shadow-[0_4px_12px_rgba(0,0,0,0.3)] outline-none"
         >
-          {/* Agent list — greyed out when auto is active, scrollable for long lists */}
-          <div
-            className={cn(
-              "max-h-64 overflow-y-auto py-1",
-              isAuto && "pointer-events-none opacity-50"
-            )}
-          >
+          {/* Agent list — scrollable for long lists */}
+          <div className="max-h-64 overflow-y-auto py-1">
             {!loaded && selectableOptions.length === 0 ? (
               <div className="text-muted-light px-2.5 py-2 text-[11px]">Loading agents…</div>
             ) : selectableOptions.length === 0 ? (
               <div className="text-muted-light px-2.5 py-2 text-[11px]">No agents available</div>
             ) : (
               selectableOptions.map((opt, index) => {
-                const isHighlighted = index === highlightedIndex && !isAuto;
+                const isHighlighted = index === highlightedIndex;
                 const isSelected = opt.id === normalizedAgentId;
                 const Icon = getAgentIcon(opt.id);
                 // Keybind label matches the item's position in selectableOptions

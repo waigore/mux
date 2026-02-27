@@ -25,6 +25,7 @@ import { MUX_HELP_CHAT_WORKSPACE_ID } from "@/common/constants/muxChat";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestratorModule from "@/node/services/utils/forkOrchestrator";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 
 // Helper to access private renamingWorkspaces set
 function addToRenamingWorkspaces(service: WorkspaceService, workspaceId: string): void {
@@ -262,7 +263,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     fakeSession = {
       isBusy: mock(() => true),
-      queueMessage: mock(() => undefined),
+      queueMessage: mock(() => "tool-end" as const),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
     };
@@ -437,6 +438,87 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(getAgentTaskStatus).toHaveBeenCalledWith("test-workspace");
     expect(markInterruptedTaskRunning).not.toHaveBeenCalled();
     expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+  });
+
+  test("backgrounds foreground task waits when queuing a tool-end message", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+
+    const backgroundForegroundWaitsForWorkspace = mock(() => 0);
+    workspaceService.setTaskService({
+      getAgentTaskStatus: mock(() => "running" as const),
+      backgroundForegroundWaitsForWorkspace,
+    } as unknown as TaskService);
+
+    const result = await workspaceService.sendMessage("test-workspace", "hello", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+
+    expect(result.success).toBe(true);
+    expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith("test-workspace");
+    expect(fakeSession.queueMessage).toHaveBeenCalled();
+  });
+
+  test("does not background foreground task waits when queuing a turn-end message", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+    fakeSession.queueMessage.mockReturnValue("turn-end");
+
+    const backgroundForegroundWaitsForWorkspace = mock(() => 0);
+    workspaceService.setTaskService({
+      getAgentTaskStatus: mock(() => "running" as const),
+      backgroundForegroundWaitsForWorkspace,
+    } as unknown as TaskService);
+
+    const result = await workspaceService.sendMessage("test-workspace", "hello", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+      queueDispatchMode: "turn-end",
+    });
+
+    expect(result.success).toBe(true);
+    expect(backgroundForegroundWaitsForWorkspace).not.toHaveBeenCalled();
+    expect(fakeSession.queueMessage).toHaveBeenCalled();
+  });
+
+  test("does not background foreground task waits when queueMessage enqueues nothing", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+    fakeSession.queueMessage.mockReturnValue(null);
+
+    const backgroundForegroundWaitsForWorkspace = mock(() => 0);
+    workspaceService.setTaskService({
+      getAgentTaskStatus: mock(() => "running" as const),
+      backgroundForegroundWaitsForWorkspace,
+    } as unknown as TaskService);
+
+    const result = await workspaceService.sendMessage("test-workspace", "   ", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+
+    expect(result.success).toBe(true);
+    expect(backgroundForegroundWaitsForWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("backgrounds foreground task waits when effective queue mode is tool-end despite incoming turn-end", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+    // Incoming mode is turn-end but queue's effective mode is tool-end (sticky from prior enqueue)
+    fakeSession.queueMessage.mockReturnValue("tool-end");
+
+    const backgroundForegroundWaitsForWorkspace = mock(() => 0);
+    workspaceService.setTaskService({
+      getAgentTaskStatus: mock(() => "running" as const),
+      backgroundForegroundWaitsForWorkspace,
+    } as unknown as TaskService);
+
+    const result = await workspaceService.sendMessage("test-workspace", "hello", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+      queueDispatchMode: "turn-end",
+    });
+
+    expect(result.success).toBe(true);
+    expect(backgroundForegroundWaitsForWorkspace).toHaveBeenCalledWith("test-workspace");
+    expect(fakeSession.queueMessage).toHaveBeenCalled();
   });
 
   test("sendMessage restores interrupted status when resumed send fails", async () => {
@@ -810,6 +892,70 @@ describe("WorkspaceService idle compaction dispatch", () => {
     }
     expect(executionError.message).toContain("idle-only send was skipped");
   });
+  test("prefers global compact thinking default over exec and activity fallbacks", async () => {
+    const projectPath = "/tmp/project";
+    const workspacePath = "/tmp/project/ws";
+
+    type ThinkingLevel = Parameters<typeof enforceThinkingPolicy>[1];
+
+    interface WorkspaceServiceIdleCompactionAccess {
+      buildIdleCompactionSendOptions: (workspaceId: string) => Promise<{
+        model: string;
+        thinkingLevel: ThinkingLevel;
+      }>;
+      config: {
+        findWorkspace: (
+          workspaceId: string
+        ) => { projectPath: string; workspacePath: string } | null;
+        loadConfigOrDefault: () => {
+          projects: Map<string, { workspaces: Array<Record<string, unknown>> }>;
+          agentAiDefaults?: {
+            compact?: {
+              thinkingLevel?: ThinkingLevel;
+            };
+          };
+        };
+      };
+      extensionMetadata: ExtensionMetadataService;
+    }
+
+    const svc = workspaceService as unknown as WorkspaceServiceIdleCompactionAccess;
+
+    svc.config.findWorkspace = mock((workspaceId: string) =>
+      workspaceId === "ws" ? { projectPath, workspacePath } : null
+    );
+    svc.config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                id: "ws",
+                path: workspacePath,
+                name: "ws",
+                aiSettingsByAgent: {
+                  exec: { model: "openai:gpt-4o-mini", thinkingLevel: "low" },
+                },
+              },
+            ],
+          },
+        ],
+      ]),
+      agentAiDefaults: {
+        compact: { thinkingLevel: "high" as ThinkingLevel },
+      },
+    }));
+
+    svc.extensionMetadata = {
+      getMetadata: mock(() => Promise.resolve({ lastThinkingLevel: "off" })),
+    } as unknown as ExtensionMetadataService;
+
+    const options = await svc.buildIdleCompactionSendOptions("ws");
+
+    expect(options.thinkingLevel).toBe(enforceThinkingPolicy(options.model, "high"));
+  });
+
   test("does not tag streaming=true snapshots as idle compaction", async () => {
     const workspaceId = "idle-streaming-true-no-tag";
     const snapshot = {

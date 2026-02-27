@@ -3,7 +3,7 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
-import type { DuckDBConnection } from "@duckdb/node-api";
+import { DuckDBAppender, DuckDBDateValue, type DuckDBConnection } from "@duckdb/node-api";
 import { EventRowSchema, type EventRow } from "@/common/orpc/schemas/analytics";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -12,6 +12,14 @@ import { log } from "@/node/services/log";
 export const CHAT_FILE_NAME = "chat.jsonl";
 const METADATA_FILE_NAME = "metadata.json";
 const SUBAGENT_TRANSCRIPTS_DIR_NAME = "subagent-transcripts";
+const SESSION_USAGE_FILE_NAME = "session-usage.json";
+const SUBAGENT_REPORTS_FILE_NAME = "subagent-reports.json";
+
+/**
+ * Maximum number of workspace directories to parse in parallel during rebuildAll.
+ * Balances disk throughput against file-descriptor pressure.
+ */
+const REBUILD_CONCURRENCY = 16;
 
 const INSERT_EVENT_SQL = `
 INSERT INTO events (
@@ -49,6 +57,114 @@ INSERT INTO events (
 )
 `;
 
+function appendVarcharOrNull(appender: DuckDBAppender, value: string | null | undefined): void {
+  if (value != null) {
+    appender.appendVarchar(value);
+  } else {
+    appender.appendNull();
+  }
+}
+
+function appendDoubleOrNull(appender: DuckDBAppender, value: number | null | undefined): void {
+  if (value != null) {
+    appender.appendDouble(value);
+  } else {
+    appender.appendNull();
+  }
+}
+
+function appendIntegerOrNull(appender: DuckDBAppender, value: number | null | undefined): void {
+  if (value != null) {
+    appender.appendInteger(value);
+  } else {
+    appender.appendNull();
+  }
+}
+
+function appendBigIntOrNull(appender: DuckDBAppender, value: number | null | undefined): void {
+  if (value != null) {
+    appender.appendBigInt(BigInt(Math.trunc(value)));
+  } else {
+    appender.appendNull();
+  }
+}
+
+function appendDateOrNull(appender: DuckDBAppender, dateStr: string | null | undefined): void {
+  if (dateStr == null) {
+    appender.appendNull();
+    return;
+  }
+
+  const [y, m, d] = dateStr.split("-").map(Number);
+  assert(
+    Number.isFinite(y) && Number.isFinite(m) && Number.isFinite(d),
+    `appendDateOrNull: invalid date "${dateStr}"`
+  );
+  appender.appendDate(DuckDBDateValue.fromParts({ year: y, month: m, day: d }));
+}
+
+export async function appendEvents(conn: DuckDBConnection, events: IngestEvent[]): Promise<void> {
+  assert(INSERT_EVENT_SQL.length > 0, "appendEvents: expected INSERT_EVENT_SQL to remain defined");
+
+  if (events.length === 0) {
+    return;
+  }
+
+  const appender = await conn.createAppender("events");
+
+  try {
+    assert(
+      appender instanceof DuckDBAppender,
+      "appendEvents: expected createAppender to return a DuckDBAppender"
+    );
+
+    for (const event of events) {
+      const row = event.row;
+      appendVarcharOrNull(appender, row.workspace_id);
+      appendVarcharOrNull(appender, row.project_path);
+      appendVarcharOrNull(appender, row.project_name);
+      appendVarcharOrNull(appender, row.workspace_name);
+      appendVarcharOrNull(appender, row.parent_workspace_id);
+      appendVarcharOrNull(appender, row.agent_id);
+      appendBigIntOrNull(appender, row.timestamp);
+      appendDateOrNull(appender, event.date);
+      appendVarcharOrNull(appender, row.model);
+      appendVarcharOrNull(appender, row.thinking_level);
+      appender.appendInteger(row.input_tokens);
+      appender.appendInteger(row.output_tokens);
+      appender.appendInteger(row.reasoning_tokens);
+      appender.appendInteger(row.cached_tokens);
+      appender.appendInteger(row.cache_create_tokens);
+      appender.appendDouble(row.input_cost_usd);
+      appender.appendDouble(row.output_cost_usd);
+      appender.appendDouble(row.reasoning_cost_usd);
+      appender.appendDouble(row.cached_cost_usd);
+      appender.appendDouble(row.total_cost_usd);
+      appendDoubleOrNull(appender, row.duration_ms);
+      appendDoubleOrNull(appender, row.ttft_ms);
+      appendDoubleOrNull(appender, row.streaming_ms);
+      appendDoubleOrNull(appender, row.tool_execution_ms);
+      appendDoubleOrNull(appender, row.output_tps);
+      appendIntegerOrNull(appender, row.response_index);
+      appender.appendBoolean(row.is_sub_agent);
+      appender.endRow();
+    }
+
+    appender.flushSync();
+  } finally {
+    appender.closeSync();
+  }
+}
+
+const INSERT_DELEGATION_ROLLUP_SQL = `
+INSERT OR REPLACE INTO delegation_rollups (
+  parent_workspace_id, child_workspace_id, project_path, project_name,
+  agent_type, model, total_tokens, context_tokens,
+  input_tokens, output_tokens, reasoning_tokens, cached_tokens, cache_create_tokens,
+  report_token_estimate, total_cost_usd, rolled_up_at_ms, date
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`;
+
 interface WorkspaceMeta {
   projectPath?: string;
   projectName?: string;
@@ -67,6 +183,21 @@ interface IngestEvent {
   row: EventRow;
   sequence: number;
   date: string | null;
+}
+
+interface DelegationRollupRaw {
+  usageData: Record<string, unknown> | null;
+  reportTokenByChildId: Map<string, number>;
+}
+
+interface ParsedWorkspaceData {
+  workspaceId: string;
+  sessionDir: string;
+  events: IngestEvent[];
+  stat: { mtimeMs: number };
+  workspaceMeta: WorkspaceMeta;
+  delegationRollupRaw: DelegationRollupRaw;
+  archivedTranscripts: ParsedWorkspaceData[];
 }
 
 interface EventHeadSignatureParts {
@@ -487,6 +618,7 @@ export async function clearWorkspaceAnalyticsState(
   try {
     await conn.run("DELETE FROM events WHERE workspace_id = ?", [workspaceId]);
     await conn.run("DELETE FROM ingest_watermarks WHERE workspace_id = ?", [workspaceId]);
+    await conn.run("DELETE FROM delegation_rollups WHERE parent_workspace_id = ?", [workspaceId]);
     await conn.run("COMMIT");
   } catch (error) {
     await conn.run("ROLLBACK");
@@ -637,8 +769,6 @@ async function replaceEventsByResponseIndex(
 
   await conn.run("BEGIN TRANSACTION");
   try {
-    // response_index is stable for in-place rewrites, so delete before insert to
-    // ensure rewritten rows replace stale analytics entries instead of appending.
     await conn.run(
       `DELETE FROM events WHERE workspace_id = ? AND response_index IN (${placeholders})`,
       [workspaceId, ...responseIndexes]
@@ -797,12 +927,15 @@ export async function ingestWorkspace(
   }
 
   const watermark = await readWatermark(conn, workspaceId);
+  const persistedMeta = await readWorkspaceMetaFromDisk(sessionDir);
+  const workspaceMeta = mergeWorkspaceMeta(persistedMeta, meta);
+
+  // Keep delegation rollups fresh even when chat.jsonl is unchanged.
+  await ingestDelegationRollups(conn, workspaceId, sessionDir, workspaceMeta);
+
   if (stat.mtimeMs <= watermark.lastModified) {
     return;
   }
-
-  const persistedMeta = await readWorkspaceMetaFromDisk(sessionDir);
-  const workspaceMeta = mergeWorkspaceMeta(persistedMeta, meta);
 
   const chatContents = await fs.readFile(chatPath, "utf-8");
   const lines = chatContents.split("\n").filter((line) => line.trim().length > 0);
@@ -978,6 +1111,338 @@ async function ingestArchivedSubagentTranscripts(
 
   return ingested;
 }
+
+/**
+ * Core DB-write logic for delegation rollups.
+ * Both ingestDelegationRollups (file-based) and writeDelegationRollupsFromParsed
+ * (pre-read data) delegate to this function.
+ */
+async function writeDelegationRollupEntries(
+  conn: DuckDBConnection,
+  workspaceId: string,
+  usageData: Record<string, unknown> | null,
+  reportTokenByChildId: Map<string, number>,
+  workspaceMeta: WorkspaceMeta
+): Promise<void> {
+  if (usageData == null) {
+    await conn.run("DELETE FROM delegation_rollups WHERE parent_workspace_id = ?", [workspaceId]);
+    return;
+  }
+
+  const rolledUpFrom = usageData.rolledUpFrom;
+  if (!isRecord(rolledUpFrom) || Object.keys(rolledUpFrom).length === 0) {
+    await conn.run("DELETE FROM delegation_rollups WHERE parent_workspace_id = ?", [workspaceId]);
+    return;
+  }
+
+  await conn.run("BEGIN TRANSACTION");
+  try {
+    await conn.run("DELETE FROM delegation_rollups WHERE parent_workspace_id = ?", [workspaceId]);
+
+    for (const [childId, entry] of Object.entries(rolledUpFrom)) {
+      // Skip legacy boolean entries
+      if (entry === true || !isRecord(entry)) continue;
+
+      const totalTokens = toFiniteInteger(entry.totalTokens) ?? 0;
+      const contextTokens = toFiniteInteger(entry.contextTokens) ?? 0;
+      const inputTokens = toFiniteInteger(entry.inputTokens) ?? 0;
+      const outputTokens = toFiniteInteger(entry.outputTokens) ?? 0;
+      const reasoningTokens = toFiniteInteger(entry.reasoningTokens) ?? 0;
+      const cachedTokens = toFiniteInteger(entry.cachedTokens) ?? 0;
+      const cacheCreateTokens = toFiniteInteger(entry.cacheCreateTokens) ?? 0;
+      const totalCostUsd = toFiniteNumber(entry.totalCostUsd) ?? 0;
+      const agentType = toOptionalString(entry.agentType) ?? null;
+      const model = toOptionalString(entry.model) ?? null;
+      const rolledUpAtMs = toFiniteNumber(entry.rolledUpAtMs) ?? null;
+      const reportTokenEstimate = reportTokenByChildId.get(childId) ?? 0;
+      const dateBucket = dateBucketFromTimestamp(rolledUpAtMs);
+
+      await conn.run(INSERT_DELEGATION_ROLLUP_SQL, [
+        workspaceId,
+        childId,
+        workspaceMeta.projectPath ?? null,
+        workspaceMeta.projectName ?? null,
+        agentType,
+        model,
+        totalTokens,
+        contextTokens,
+        inputTokens,
+        outputTokens,
+        reasoningTokens,
+        cachedTokens,
+        cacheCreateTokens,
+        reportTokenEstimate,
+        totalCostUsd,
+        rolledUpAtMs,
+        dateBucket,
+      ]);
+    }
+    await conn.run("COMMIT");
+  } catch (error) {
+    await conn.run("ROLLBACK");
+    throw error;
+  }
+}
+
+/** Read session-usage.json and subagent-reports.json, then insert delegation_rollups rows. */
+async function ingestDelegationRollups(
+  conn: DuckDBConnection,
+  workspaceId: string,
+  sessionDir: string,
+  workspaceMeta: WorkspaceMeta
+): Promise<void> {
+  const usagePath = path.join(sessionDir, SESSION_USAGE_FILE_NAME);
+  let usageData: Record<string, unknown> | null = null;
+
+  try {
+    const usageRaw = await fs.readFile(usagePath, "utf-8");
+    const parsed: unknown = JSON.parse(usageRaw);
+    if (isRecord(parsed)) {
+      usageData = parsed;
+    }
+  } catch (error) {
+    if (!(isRecord(error) && error.code === "ENOENT")) {
+      log.warn("[analytics-etl] Failed to read session-usage.json for delegation rollups", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    // usageData stays null -> writeDelegationRollupEntries clears stale rows.
+  }
+
+  // Read subagent-reports.json for reportTokenEstimate lookup.
+  const reportTokenByChildId = await readReportTokenEstimates(sessionDir);
+  await writeDelegationRollupEntries(
+    conn,
+    workspaceId,
+    usageData,
+    reportTokenByChildId,
+    workspaceMeta
+  );
+}
+
+async function readReportTokenEstimates(sessionDir: string): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  const reportsPath = path.join(sessionDir, SUBAGENT_REPORTS_FILE_NAME);
+  try {
+    const raw = await fs.readFile(reportsPath, "utf-8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) return result;
+    const artifacts = parsed.artifactsByChildTaskId;
+    if (!isRecord(artifacts)) return result;
+    for (const [childId, artifact] of Object.entries(artifacts)) {
+      if (!isRecord(artifact)) continue;
+      const estimate = toFiniteInteger(artifact.reportTokenEstimate);
+      if (estimate != null && estimate > 0) {
+        result.set(childId, estimate);
+      }
+    }
+  } catch {
+    // Missing or invalid file — not an error, just no report data.
+  }
+  return result;
+}
+
+async function readDelegationRollupFilesFromDisk(sessionDir: string): Promise<DelegationRollupRaw> {
+  const usagePath = path.join(sessionDir, SESSION_USAGE_FILE_NAME);
+  let usageData: Record<string, unknown> | null = null;
+  try {
+    const raw = await fs.readFile(usagePath, "utf-8");
+    const parsed: unknown = JSON.parse(raw);
+    if (isRecord(parsed)) {
+      usageData = parsed;
+    }
+  } catch {
+    // ENOENT or parse error → null
+  }
+
+  const reportTokenByChildId = await readReportTokenEstimates(sessionDir);
+  return { usageData, reportTokenByChildId };
+}
+
+export async function writeDelegationRollupsFromParsed(
+  conn: DuckDBConnection,
+  workspaceId: string,
+  delegationRollupRaw: DelegationRollupRaw,
+  workspaceMeta: WorkspaceMeta
+): Promise<void> {
+  assert(
+    workspaceId.trim().length > 0,
+    "writeDelegationRollupsFromParsed: workspaceId is required"
+  );
+
+  await writeDelegationRollupEntries(
+    conn,
+    workspaceId,
+    delegationRollupRaw.usageData,
+    delegationRollupRaw.reportTokenByChildId,
+    workspaceMeta
+  );
+}
+
+async function parseArchivedTranscriptsFromDisk(
+  sessionDir: string,
+  parentMeta: WorkspaceMeta,
+  parentWorkspaceId: string
+): Promise<ParsedWorkspaceData[]> {
+  const transcriptsDir = path.join(sessionDir, SUBAGENT_TRANSCRIPTS_DIR_NAME);
+
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(transcriptsDir, { withFileTypes: true });
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") {
+      return [];
+    }
+    log.warn("[analytics-etl] Failed to read archived sub-agent transcripts directory", {
+      transcriptsDir,
+      error: getErrorMessage(error),
+    });
+    return [];
+  }
+
+  const results: ParsedWorkspaceData[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const childWorkspaceId = entry.name;
+    const archivedSessionDir = path.join(transcriptsDir, childWorkspaceId);
+
+    try {
+      const archivedWorkspaceMeta = await readWorkspaceMetaFromDisk(archivedSessionDir);
+      const overrideMeta: WorkspaceMeta = {
+        projectPath: parentMeta.projectPath,
+        projectName: parentMeta.projectName,
+        workspaceName: archivedWorkspaceMeta.workspaceName,
+      };
+
+      if (!archivedWorkspaceMeta.parentWorkspaceId) {
+        overrideMeta.parentWorkspaceId = parentWorkspaceId;
+      }
+
+      const parsed = await parseWorkspaceFromDisk(
+        childWorkspaceId,
+        archivedSessionDir,
+        overrideMeta
+      );
+      if (parsed) {
+        results.push(parsed);
+      }
+    } catch (error) {
+      log.warn("[analytics-etl] Failed to parse archived sub-agent transcript", {
+        childWorkspaceId,
+        sessionDir,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  return results;
+}
+
+export async function parseWorkspaceFromDisk(
+  workspaceId: string,
+  sessionDir: string,
+  suppliedMeta: WorkspaceMeta
+): Promise<ParsedWorkspaceData | null> {
+  assert(workspaceId.trim().length > 0, "parseWorkspaceFromDisk: workspaceId is required");
+  assert(sessionDir.trim().length > 0, "parseWorkspaceFromDisk: sessionDir is required");
+
+  const chatPath = path.join(sessionDir, CHAT_FILE_NAME);
+
+  let stat: Awaited<ReturnType<typeof fs.stat>>;
+  try {
+    stat = await fs.stat(chatPath);
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+
+  const persistedMeta = await readWorkspaceMetaFromDisk(sessionDir);
+  const workspaceMeta = mergeWorkspaceMeta(persistedMeta, suppliedMeta);
+
+  const chatContents = await fs.readFile(chatPath, "utf-8");
+  const lines = chatContents.split("\n").filter((line) => line.trim().length > 0);
+
+  let responseIndex = 0;
+  const events: IngestEvent[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    assert(line != null, "parseWorkspaceFromDisk: line should not be null after filter");
+    const message = parsePersistedMessage(line, workspaceId, i + 1);
+    if (!message) {
+      continue;
+    }
+
+    const event = extractIngestEvent({
+      workspaceId,
+      workspaceMeta,
+      message,
+      lineNumber: i + 1,
+      responseIndex,
+    });
+    if (!event) {
+      continue;
+    }
+
+    responseIndex += 1;
+    events.push(event);
+  }
+
+  const delegationRollupRaw = await readDelegationRollupFilesFromDisk(sessionDir);
+  const archivedTranscripts = await parseArchivedTranscriptsFromDisk(
+    sessionDir,
+    workspaceMeta,
+    workspaceId
+  );
+
+  return {
+    workspaceId,
+    sessionDir,
+    events,
+    stat: { mtimeMs: stat.mtimeMs },
+    workspaceMeta,
+    delegationRollupRaw,
+    archivedTranscripts,
+  };
+}
+
+interface CollectedEvents {
+  eventsByWorkspace: Map<string, IngestEvent[]>;
+  /** Tracks the chat.jsonl mtime of the dedup winner per workspace ID. */
+  winnerMtimes: Map<string, number>;
+}
+
+/** Collect parsed workspaces (including archived transcripts) into deduplicated workspace event groups. */
+function collectAllEvents(parsed: ParsedWorkspaceData[]): CollectedEvents {
+  // Workspace-level dedup with recency: if the same workspace_id appears from multiple
+  // sources (e.g. top-level session + archived sub-agent transcript), keep the
+  // freshest occurrence by mtime so traversal order does not affect rebuild output.
+  const eventsByWorkspace = new Map<string, IngestEvent[]>();
+  const winnerMtimes = new Map<string, number>();
+
+  function collect(workspaces: ParsedWorkspaceData[]): void {
+    for (const workspace of workspaces) {
+      const existingMtime = winnerMtimes.get(workspace.workspaceId);
+      if (existingMtime == null || workspace.stat.mtimeMs >= existingMtime) {
+        eventsByWorkspace.set(workspace.workspaceId, workspace.events);
+        winnerMtimes.set(workspace.workspaceId, workspace.stat.mtimeMs);
+      }
+
+      if (workspace.archivedTranscripts.length > 0) {
+        collect(workspace.archivedTranscripts);
+      }
+    }
+  }
+
+  collect(parsed);
+  return { eventsByWorkspace, winnerMtimes };
+}
+
 export async function rebuildAll(
   conn: DuckDBConnection,
   sessionsDir: string,
@@ -991,10 +1456,11 @@ export async function rebuildAll(
 
   await conn.run("BEGIN TRANSACTION");
   try {
-    // Reset both tables atomically so a crash cannot leave empty events with
-    // stale watermarks that would incorrectly suppress initial backfill.
+    // Reset analytics tables atomically so a crash cannot leave empty events with
+    // stale watermarks or stale delegation rollups that suppress rebuild accuracy.
     await conn.run("DELETE FROM events");
     await conn.run("DELETE FROM ingest_watermarks");
+    await conn.run("DELETE FROM delegation_rollups");
     await conn.run("COMMIT");
   } catch (error) {
     await conn.run("ROLLBACK");
@@ -1014,25 +1480,112 @@ export async function rebuildAll(
 
   assert(entries, "rebuildAll expected a directory listing");
 
-  let workspacesIngested = 0;
+  const directoryEntries = entries.filter((entry) => entry.isDirectory());
 
-  for (const entry of entries) {
-    if (!entry.isDirectory()) {
-      continue;
+  const allParsed: ParsedWorkspaceData[] = [];
+  for (let i = 0; i < directoryEntries.length; i += REBUILD_CONCURRENCY) {
+    const batch = directoryEntries.slice(i, i + REBUILD_CONCURRENCY);
+
+    const results = await Promise.allSettled(
+      batch.map((entry) => {
+        const workspaceId = entry.name;
+        const sessionDir = path.join(sessionsDir, workspaceId);
+        const suppliedWorkspaceMeta = workspaceMetaById[workspaceId] ?? {};
+        return parseWorkspaceFromDisk(workspaceId, sessionDir, suppliedWorkspaceMeta);
+      })
+    );
+
+    for (let j = 0; j < results.length; j++) {
+      const result = results[j];
+      const batchEntry = batch[j];
+      assert(result, "rebuildAll: Promise.allSettled result should always be present");
+
+      if (result.status === "fulfilled") {
+        if (result.value != null) {
+          allParsed.push(result.value);
+        }
+        continue;
+      }
+
+      log.warn("[analytics-etl] Failed to parse workspace during rebuild", {
+        workspaceId: batchEntry?.name,
+        error: getErrorMessage(result.reason),
+      });
     }
+  }
 
-    const workspaceId = entry.name;
-    const sessionDir = path.join(sessionsDir, workspaceId);
-    const suppliedWorkspaceMeta = workspaceMetaById[workspaceId] ?? {};
-
+  // Phase 2a: Per-workspace bulk-append with isolation.
+  // Keep rebuild resilient: a malformed event batch in one workspace should not
+  // prevent unrelated workspace analytics data from being rebuilt.
+  const { eventsByWorkspace, winnerMtimes } = collectAllEvents(allParsed);
+  const failedWorkspaceIds = new Set<string>();
+  for (const [workspaceId, events] of eventsByWorkspace) {
     try {
-      await ingestWorkspace(conn, workspaceId, sessionDir, suppliedWorkspaceMeta);
-      workspacesIngested += 1;
+      await appendEvents(conn, events);
     } catch (error) {
-      log.warn("[analytics-etl] Failed to ingest workspace during rebuild", {
+      failedWorkspaceIds.add(workspaceId);
+      log.warn("[analytics-etl] Failed to append events for workspace during rebuild", {
         workspaceId,
         error: getErrorMessage(error),
       });
+    }
+  }
+
+  async function writeWorkspaceMetadata(
+    workspaces: ParsedWorkspaceData[],
+    failedWorkspaceIds: Set<string>,
+    winnerMtimes: Map<string, number>
+  ): Promise<void> {
+    for (const workspace of workspaces) {
+      try {
+        // Only write metadata for the dedup winner instance (matching mtime)
+        // that also appended successfully. This prevents stale duplicates with
+        // the same workspaceId from overwriting fresh winner metadata.
+        const winnerMtime = winnerMtimes.get(workspace.workspaceId);
+        const isDedupeWinner = winnerMtime != null && workspace.stat.mtimeMs === winnerMtime;
+        const shouldWriteMetadata =
+          isDedupeWinner && !failedWorkspaceIds.has(workspace.workspaceId);
+
+        if (shouldWriteMetadata) {
+          const maxSequence = getMaxSequence(workspace.events) ?? -1;
+          await writeWatermark(conn, workspace.workspaceId, {
+            lastSequence: maxSequence,
+            lastModified: workspace.stat.mtimeMs,
+          });
+
+          await writeDelegationRollupsFromParsed(
+            conn,
+            workspace.workspaceId,
+            workspace.delegationRollupRaw,
+            workspace.workspaceMeta
+          );
+        }
+      } catch (error) {
+        log.warn("[analytics-etl] Failed to write metadata during rebuild", {
+          workspaceId: workspace.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+
+      // Always recurse into archived children regardless of parent metadata
+      // write eligibility so successful child workspaces still get metadata.
+      if (workspace.archivedTranscripts.length > 0) {
+        await writeWorkspaceMetadata(
+          workspace.archivedTranscripts,
+          failedWorkspaceIds,
+          winnerMtimes
+        );
+      }
+    }
+  }
+
+  // Phase 2b: Write metadata only for dedup winners that appended successfully.
+  await writeWorkspaceMetadata(allParsed, failedWorkspaceIds, winnerMtimes);
+
+  let workspacesIngested = 0;
+  for (const workspace of allParsed) {
+    if (!failedWorkspaceIds.has(workspace.workspaceId)) {
+      workspacesIngested += 1;
     }
   }
 

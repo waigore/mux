@@ -11,9 +11,9 @@ import {
 import { Skeleton } from "@/browser/components/ui/skeleton";
 import type { TokensByModelItem } from "@/browser/hooks/useAnalytics";
 import {
-  ANALYTICS_CHART_COLORS,
   CHART_AXIS_STROKE,
   CHART_AXIS_TICK,
+  TOKEN_CATEGORY_COLORS,
   formatCompactNumber,
 } from "./analyticsUtils";
 
@@ -22,15 +22,6 @@ interface TokensByModelChartProps {
   loading: boolean;
   error: string | null;
 }
-
-// Stable color assignments for each token category.
-const TOKEN_CATEGORY_COLORS = {
-  inputTokens: ANALYTICS_CHART_COLORS[0],
-  cachedTokens: ANALYTICS_CHART_COLORS[3],
-  cacheCreateTokens: ANALYTICS_CHART_COLORS[4],
-  outputTokens: ANALYTICS_CHART_COLORS[1],
-  reasoningTokens: ANALYTICS_CHART_COLORS[2],
-} as const;
 
 function isTokensByModelItem(value: unknown): value is TokensByModelItem {
   if (!value || typeof value !== "object") {
@@ -69,12 +60,14 @@ function TokensByModelTooltipContent(props: {
         <span>Cached</span>
         <span className="text-foreground font-mono">{formatCompactNumber(row.cachedTokens)}</span>
       </div>
-      <div className="text-muted flex items-center justify-between gap-4">
-        <span>Cache write</span>
-        <span className="text-foreground font-mono">
-          {formatCompactNumber(row.cacheCreateTokens)}
-        </span>
-      </div>
+      {row.cacheCreateTokens > 0 ? (
+        <div className="text-muted flex items-center justify-between gap-4">
+          <span>Cache write</span>
+          <span className="text-foreground font-mono">
+            {formatCompactNumber(row.cacheCreateTokens)}
+          </span>
+        </div>
+      ) : null}
       <div className="text-muted flex items-center justify-between gap-4">
         <span>Output</span>
         <span className="text-foreground font-mono">{formatCompactNumber(row.outputTokens)}</span>

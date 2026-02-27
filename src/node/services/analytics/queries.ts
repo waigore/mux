@@ -3,6 +3,8 @@ import type { DuckDBConnection, DuckDBValue } from "@duckdb/node-api";
 import type { z } from "zod";
 import {
   AgentCostRowSchema,
+  DelegationAgentBreakdownRowSchema,
+  DelegationSummaryTotalsRowSchema,
   HistogramBucketSchema,
   ProviderCacheHitModelRowSchema,
   SpendByModelRowSchema,
@@ -12,6 +14,8 @@ import {
   TimingPercentilesRowSchema,
   TokensByModelRowSchema,
   type AgentCostRow,
+  type DelegationAgentBreakdownRow,
+  type DelegationSummaryTotalsRow,
   type HistogramBucket,
   type ProviderCacheHitModelRow,
   type SpendByModelRow,
@@ -31,6 +35,11 @@ type TimingMetric = "ttft" | "duration" | "tps";
 interface TimingDistributionResult {
   percentiles: TimingPercentilesRow;
   histogram: HistogramBucket[];
+}
+
+interface DelegationSummaryResult {
+  totals: DelegationSummaryTotalsRow;
+  breakdown: DelegationAgentBreakdownRow[];
 }
 
 function normalizeDuckDbValue(value: unknown): unknown {
@@ -350,18 +359,34 @@ async function queryTimingDistribution(
   // Histogram emits real metric values (e.g. ms, tok/s) as bucket labels,
   // not abstract 1..20 indices. This way the chart x-axis maps directly to
   // meaningful units and percentile reference lines land correctly.
+  //
+  // Cap the histogram range at p99 so a single extreme outlier does not flatten
+  // the distribution for the other 99% of responses. If p99 collapses to min
+  // (for near-constant datasets), fall back to raw max to preserve bucket spread.
   const histogram = await typedQuery(
     conn,
     `
-    WITH stats AS (
+    WITH raw_stats AS (
       SELECT
         MIN(${column}) AS min_value,
-        MAX(${column}) AS max_value
+        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY ${column}) AS p99_value,
+        MAX(${column}) AS raw_max_value
       FROM events
       WHERE ${column} IS NOT NULL
         AND (? IS NULL OR project_path = ?)
         AND (? IS NULL OR date >= CAST(? AS DATE))
         AND (? IS NULL OR date <= CAST(? AS DATE))
+    ),
+    stats AS (
+      SELECT
+        min_value,
+        CASE
+          -- If p99 collapses to the minimum (e.g. >99% identical values),
+          -- fall back to the raw max so outliers do not get forced into bucket 1.
+          WHEN p99_value = min_value AND raw_max_value > p99_value THEN raw_max_value
+          ELSE p99_value
+        END AS max_value
+      FROM raw_stats
     ),
     bucketed AS (
       SELECT
@@ -471,6 +496,72 @@ async function queryCacheHitRatioByProvider(
   );
 }
 
+async function queryDelegationSummary(
+  conn: DuckDBConnection,
+  params: { projectPath: string | null; from: string | null; to: string | null }
+): Promise<DelegationSummaryResult> {
+  const filterParams: DuckDBValue[] = [
+    params.projectPath,
+    params.projectPath,
+    params.from,
+    params.from,
+    params.to,
+    params.to,
+  ];
+
+  const whereClause = `
+    WHERE (? IS NULL OR project_path = ?)
+      AND (? IS NULL OR date >= CAST(? AS DATE))
+      AND (? IS NULL OR date <= CAST(? AS DATE))
+  `;
+
+  const totals = await typedQueryOne(
+    conn,
+    `
+    SELECT
+      COALESCE(COUNT(*), 0) AS total_children,
+      COALESCE(SUM(total_tokens), 0) AS total_tokens_consumed,
+      COALESCE(SUM(report_token_estimate), 0) AS total_report_tokens,
+      COALESCE(
+        CASE
+          WHEN SUM(CASE WHEN report_token_estimate > 0 THEN report_token_estimate ELSE 0 END) = 0 THEN 0
+          ELSE SUM(CASE WHEN report_token_estimate > 0 THEN total_tokens ELSE 0 END)::DOUBLE
+               / SUM(CASE WHEN report_token_estimate > 0 THEN report_token_estimate ELSE 0 END)
+        END,
+        0
+      ) AS compression_ratio,
+      COALESCE(SUM(total_cost_usd), 0) AS total_cost_delegated
+    FROM delegation_rollups
+    ${whereClause}
+    `,
+    [...filterParams],
+    DelegationSummaryTotalsRowSchema
+  );
+
+  const breakdown = await typedQuery(
+    conn,
+    `
+    SELECT
+      COALESCE(agent_type, 'unknown') AS agent_type,
+      COALESCE(COUNT(*), 0) AS delegation_count,
+      COALESCE(SUM(total_tokens), 0) AS total_tokens,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+      COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+      COALESCE(SUM(cache_create_tokens), 0) AS cache_create_tokens
+    FROM delegation_rollups
+    ${whereClause}
+    GROUP BY agent_type
+    ORDER BY total_tokens DESC
+    `,
+    [...filterParams],
+    DelegationAgentBreakdownRowSchema
+  );
+
+  return { totals, breakdown };
+}
+
 export async function executeNamedQuery(
   conn: DuckDBConnection,
   queryName: string,
@@ -545,6 +636,14 @@ export async function executeNamedQuery(
         parseDateFilter(params.from),
         parseDateFilter(params.to)
       );
+    }
+
+    case "getDelegationSummary": {
+      return queryDelegationSummary(conn, {
+        projectPath: parseOptionalString(params.projectPath),
+        from: parseDateFilter(params.from),
+        to: parseDateFilter(params.to),
+      });
     }
 
     default:

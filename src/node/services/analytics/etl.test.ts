@@ -5,7 +5,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
-import { CHAT_FILE_NAME, clearWorkspaceAnalyticsState, ingestWorkspace, rebuildAll } from "./etl";
+import {
+  appendEvents,
+  CHAT_FILE_NAME,
+  clearWorkspaceAnalyticsState,
+  ingestWorkspace,
+  parseWorkspaceFromDisk,
+  rebuildAll,
+} from "./etl";
 
 const CREATE_EVENTS_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS events (
@@ -44,6 +51,29 @@ CREATE TABLE IF NOT EXISTS ingest_watermarks (
   workspace_id VARCHAR PRIMARY KEY,
   last_sequence BIGINT NOT NULL,
   last_modified DOUBLE NOT NULL
+)
+`;
+
+const CREATE_DELEGATION_ROLLUPS_TABLE_SQL = `
+CREATE TABLE IF NOT EXISTS delegation_rollups (
+  parent_workspace_id VARCHAR NOT NULL,
+  child_workspace_id VARCHAR NOT NULL,
+  project_path VARCHAR,
+  project_name VARCHAR,
+  agent_type VARCHAR,
+  model VARCHAR,
+  total_tokens INTEGER DEFAULT 0,
+  context_tokens INTEGER DEFAULT 0,
+  input_tokens INTEGER DEFAULT 0,
+  output_tokens INTEGER DEFAULT 0,
+  reasoning_tokens INTEGER DEFAULT 0,
+  cached_tokens INTEGER DEFAULT 0,
+  cache_create_tokens INTEGER DEFAULT 0,
+  report_token_estimate INTEGER DEFAULT 0,
+  total_cost_usd DOUBLE DEFAULT 0,
+  rolled_up_at_ms BIGINT,
+  date DATE,
+  PRIMARY KEY (parent_workspace_id, child_workspace_id)
 )
 `;
 
@@ -147,6 +177,7 @@ async function createTestConn(): Promise<DuckDBConnection> {
 
   await conn.run(CREATE_EVENTS_TABLE_SQL);
   await conn.run(CREATE_WATERMARK_TABLE_SQL);
+  await conn.run(CREATE_DELEGATION_ROLLUPS_TABLE_SQL);
 
   return conn;
 }
@@ -157,6 +188,13 @@ async function writeChatJsonl(sessionDir: string, lines: string[]): Promise<void
 
 async function writeMetadataJson(sessionDir: string, meta: Record<string, unknown>): Promise<void> {
   await fs.writeFile(path.join(sessionDir, "metadata.json"), JSON.stringify(meta));
+}
+
+async function writeSessionUsageJson(
+  sessionDir: string,
+  usage: Record<string, unknown>
+): Promise<void> {
+  await fs.writeFile(path.join(sessionDir, "session-usage.json"), JSON.stringify(usage));
 }
 
 async function queryRows(
@@ -218,6 +256,7 @@ describe("rebuildAll", () => {
       "BEGIN TRANSACTION",
       "DELETE FROM events",
       "DELETE FROM ingest_watermarks",
+      "DELETE FROM delegation_rollups",
       "COMMIT",
     ]);
   });
@@ -247,6 +286,94 @@ describe("rebuildAll", () => {
       "DELETE FROM ingest_watermarks",
       "ROLLBACK",
     ]);
+  });
+
+  test("continues rebuild when parsing one workspace fails", async () => {
+    const conn = await createTestConn();
+    const sessionsDir = await createTempSessionDir();
+
+    const goodWorkspaceDir = path.join(sessionsDir, "ws-good");
+    await fs.mkdir(goodWorkspaceDir, { recursive: true });
+    await writeChatJsonl(goodWorkspaceDir, [makeUserLine(), makeAssistantLine()]);
+
+    const badWorkspaceDir = path.join(sessionsDir, "ws-bad");
+    await fs.mkdir(path.join(badWorkspaceDir, CHAT_FILE_NAME), { recursive: true });
+
+    const result = await rebuildAll(conn, sessionsDir, {});
+
+    expect(result).toEqual({ workspacesIngested: 1 });
+    expect(await queryEventCount(conn)).toBe(1);
+  });
+});
+
+describe("appendEvents", () => {
+  test("inserts parsed events with expected fields", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+
+    await writeMetadataJson(sessionDir, {
+      projectPath: "/proj",
+      projectName: "my-proj",
+    });
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      makeAssistantLine({ model: "openai:gpt-4", inputTokens: 200, outputTokens: 75 }),
+    ]);
+
+    const parsed = await parseWorkspaceFromDisk("ws-append", sessionDir, {});
+    expect(parsed).not.toBeNull();
+    assert(parsed, "appendEvents test expected parseWorkspaceFromDisk to parse workspace");
+
+    await appendEvents(conn, parsed.events);
+
+    expect(await queryEventCount(conn, "ws-append")).toBe(1);
+    const rows = await queryRows(
+      conn,
+      "SELECT model, input_tokens, output_tokens, project_path FROM events WHERE workspace_id = ?",
+      ["ws-append"]
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].model).toBe("openai:gpt-4");
+    expect(parseInteger(rows[0].input_tokens, "input_tokens")).toBe(200);
+    expect(parseInteger(rows[0].output_tokens, "output_tokens")).toBe(75);
+    expect(rows[0].project_path).toBe("/proj");
+  });
+
+  test("is a no-op when events is empty", async () => {
+    const conn = await createTestConn();
+
+    await appendEvents(conn, []);
+
+    expect(await queryEventCount(conn)).toBe(0);
+  });
+});
+
+describe("parseWorkspaceFromDisk", () => {
+  test("reads chat.jsonl and metadata.json", async () => {
+    const sessionDir = await createTempSessionDir();
+    await writeMetadataJson(sessionDir, {
+      projectPath: "/test",
+      projectName: "test-proj",
+    });
+    await writeChatJsonl(sessionDir, [makeUserLine(), makeAssistantLine({ model: "gpt-4" })]);
+
+    const parsed = await parseWorkspaceFromDisk("ws-test", sessionDir, {});
+
+    expect(parsed).not.toBeNull();
+    assert(parsed, "parseWorkspaceFromDisk test expected non-null parsed workspace");
+    expect(parsed.workspaceId).toBe("ws-test");
+    expect(parsed.workspaceMeta.projectPath).toBe("/test");
+    expect(parsed.events).toHaveLength(1);
+    expect(parsed.events[0].row.model).toBe("gpt-4");
+    expect(parsed.stat.mtimeMs).toBeGreaterThan(0);
+  });
+
+  test("returns null when chat.jsonl is missing", async () => {
+    const sessionDir = await createTempSessionDir();
+
+    const parsed = await parseWorkspaceFromDisk("ws-missing", sessionDir, {});
+
+    expect(parsed).toBeNull();
   });
 });
 
@@ -501,5 +628,106 @@ describe("ingestArchivedSubagentTranscripts", () => {
     // Even without metadata.json, the fallback sets parentWorkspaceId and is_sub_agent
     expect(childRows[0].parent_workspace_id).toBe(parentWorkspaceId);
     expect(parseBooleanFromInteger(childRows[0].is_sub_agent_int, "is_sub_agent_int")).toBe(true);
+  });
+});
+
+describe("ingestDelegationRollups", () => {
+  test("should ingest per-category token fields into delegation_rollups", async () => {
+    const conn = await createTestConn();
+    const parentWorkspaceId = "parent-id";
+    const childWorkspaceId = "child-id";
+
+    const parentSessionDir = await createTempSessionDir();
+    await writeChatJsonl(parentSessionDir, [makeUserLine(), makeAssistantLine({ sequence: 1 })]);
+    await writeSessionUsageJson(parentSessionDir, {
+      byModel: {},
+      version: 1,
+      rolledUpFrom: {
+        [childWorkspaceId]: {
+          totalTokens: 1_000,
+          contextTokens: 400,
+          inputTokens: 150,
+          outputTokens: 220,
+          reasoningTokens: 80,
+          cachedTokens: 90,
+          cacheCreateTokens: 30,
+          totalCostUsd: 1.5,
+          agentType: "delegate",
+          model: "openai:gpt-5",
+          rolledUpAtMs: 1_700_000_001_000,
+        },
+      },
+    });
+
+    await ingestWorkspace(conn, parentWorkspaceId, parentSessionDir, {
+      projectPath: "/test",
+      projectName: "test-project",
+    });
+
+    const rows = await queryRows(
+      conn,
+      `SELECT
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cached_tokens,
+        cache_create_tokens
+       FROM delegation_rollups
+       WHERE parent_workspace_id = ? AND child_workspace_id = ?`,
+      [parentWorkspaceId, childWorkspaceId]
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(parseInteger(rows[0].input_tokens, "input_tokens")).toBe(150);
+    expect(parseInteger(rows[0].output_tokens, "output_tokens")).toBe(220);
+    expect(parseInteger(rows[0].reasoning_tokens, "reasoning_tokens")).toBe(80);
+    expect(parseInteger(rows[0].cached_tokens, "cached_tokens")).toBe(90);
+    expect(parseInteger(rows[0].cache_create_tokens, "cache_create_tokens")).toBe(30);
+  });
+
+  test("should default per-category tokens to 0 for legacy rollup entries", async () => {
+    const conn = await createTestConn();
+    const parentWorkspaceId = "parent-id";
+    const childWorkspaceId = "legacy-child";
+
+    const parentSessionDir = await createTempSessionDir();
+    await writeChatJsonl(parentSessionDir, [makeUserLine(), makeAssistantLine({ sequence: 1 })]);
+    await writeSessionUsageJson(parentSessionDir, {
+      byModel: {},
+      version: 1,
+      rolledUpFrom: {
+        [childWorkspaceId]: {
+          totalTokens: 650,
+          contextTokens: 275,
+          totalCostUsd: 0.8,
+          rolledUpAtMs: 1_700_000_002_000,
+        },
+      },
+    });
+
+    await ingestWorkspace(conn, parentWorkspaceId, parentSessionDir, {
+      projectPath: "/test",
+      projectName: "test-project",
+    });
+
+    const rows = await queryRows(
+      conn,
+      `SELECT
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cached_tokens,
+        cache_create_tokens
+       FROM delegation_rollups
+       WHERE parent_workspace_id = ? AND child_workspace_id = ?`,
+      [parentWorkspaceId, childWorkspaceId]
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(parseInteger(rows[0].input_tokens, "input_tokens")).toBe(0);
+    expect(parseInteger(rows[0].output_tokens, "output_tokens")).toBe(0);
+    expect(parseInteger(rows[0].reasoning_tokens, "reasoning_tokens")).toBe(0);
+    expect(parseInteger(rows[0].cached_tokens, "cached_tokens")).toBe(0);
+    expect(parseInteger(rows[0].cache_create_tokens, "cache_create_tokens")).toBe(0);
   });
 });
