@@ -9,6 +9,7 @@ import {
   buildProviderOptions,
   buildRequestHeaders,
   ANTHROPIC_1M_CONTEXT_HEADER,
+  MUX_WORKSPACE_ID_HEADER,
 } from "./providerOptions";
 
 // Mock the log module to avoid console noise
@@ -515,6 +516,46 @@ describe("buildRequestHeaders", () => {
     const result = buildRequestHeaders("anthropic:claude-opus-4-6", {
       anthropic: { use1MContext: false },
     });
+    expect(result).toBeUndefined();
+  });
+
+  test("should include X-Mux-Workspace-Id for non-Anthropic provider when workspaceId provided", () => {
+    const result = buildRequestHeaders("openai:gpt-5.2", undefined, "a1b2c3d4e5");
+    expect(result).toEqual({ [MUX_WORKSPACE_ID_HEADER]: "a1b2c3d4e5" });
+  });
+
+  test("should encode non-header-safe workspace IDs before attaching request header", () => {
+    const workspaceId = "workspace-😀";
+    const result = buildRequestHeaders("openai:gpt-5.2", undefined, workspaceId);
+
+    expect(result).toEqual({
+      [MUX_WORKSPACE_ID_HEADER]: `b64:${Buffer.from(workspaceId, "utf8").toString("base64url")}`,
+    });
+  });
+
+  test("should include both X-Mux-Workspace-Id and anthropic-beta when both apply", () => {
+    const result = buildRequestHeaders(
+      "anthropic:claude-opus-4-6",
+      { anthropic: { use1MContext: true } },
+      "a1b2c3d4e5"
+    );
+    expect(result).toEqual({
+      [MUX_WORKSPACE_ID_HEADER]: "a1b2c3d4e5",
+      "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER,
+    });
+  });
+
+  test("should include X-Mux-Workspace-Id but not anthropic-beta for Anthropic without 1M context", () => {
+    const result = buildRequestHeaders(
+      "anthropic:claude-sonnet-4-20250514",
+      undefined,
+      "deadbeef00"
+    );
+    expect(result).toEqual({ [MUX_WORKSPACE_ID_HEADER]: "deadbeef00" });
+  });
+
+  test("should return undefined when no workspaceId and no provider-specific headers apply", () => {
+    const result = buildRequestHeaders("openai:gpt-5.2");
     expect(result).toBeUndefined();
   });
 

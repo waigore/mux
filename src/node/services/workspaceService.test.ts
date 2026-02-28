@@ -1532,6 +1532,7 @@ describe("WorkspaceService remove timing rollup", () => {
         getSessionDir: mock((id: string) => path.join(sessionRoot, id)),
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
+        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
       };
 
       const timingService: Partial<SessionTimingService> = {
@@ -2422,6 +2423,63 @@ describe("WorkspaceService init cancellation", () => {
     await cleanupHistory();
   });
 
+  test("create() rejects untrusted projects", async () => {
+    const projectPath = "/tmp/proj";
+    const generateStableIdMock = mock(() => "ws-untrusted");
+
+    const mockAIService = {
+      isStreaming: mock(() => false),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      on: mock(() => {}),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      off: mock(() => {}),
+    } as unknown as AIService;
+
+    const mockConfig: Partial<Config> = {
+      rootDir: "/tmp/mux-root",
+      srcDir: "/tmp/src",
+      getSessionDir: mock(() => "/tmp/test/sessions"),
+      generateStableId: generateStableIdMock,
+      findWorkspace: mock(() => null),
+      loadConfigOrDefault: mock(() => ({
+        projects: new Map([
+          [
+            projectPath,
+            {
+              workspaces: [],
+              trusted: false,
+            },
+          ],
+        ]),
+      })),
+    };
+
+    const mockInitStateManager: Partial<InitStateManager> = {
+      on: mock(() => undefined as unknown as InitStateManager),
+      getInitState: mock(() => undefined),
+    };
+
+    const workspaceService = new WorkspaceService(
+      mockConfig as Config,
+      historyService,
+      mockAIService,
+      mockInitStateManager as InitStateManager,
+      mockExtensionMetadataService as ExtensionMetadataService,
+      mockBackgroundProcessManager as BackgroundProcessManager
+    );
+
+    const result = await workspaceService.create(projectPath, "ws-branch", undefined, "title", {
+      type: "local",
+    });
+
+    expect(result).toEqual(
+      Err(
+        "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
+      )
+    );
+    expect(generateStableIdMock).not.toHaveBeenCalled();
+  });
+
   test("archive() aborts init and still archives when init is running", async () => {
     const workspaceId = "ws-init-running";
 
@@ -2647,6 +2705,17 @@ describe("WorkspaceService init cancellation", () => {
       getEffectiveSecrets: mock(() => []),
       getSessionDir: mock(() => "/tmp/test/sessions"),
       findWorkspace: mock(() => null),
+      loadConfigOrDefault: mock(() => ({
+        projects: new Map([
+          [
+            projectPath,
+            {
+              workspaces: [],
+              trusted: true,
+            },
+          ],
+        ]),
+      })),
     };
 
     const mockAIService = {
@@ -2899,6 +2968,7 @@ describe("WorkspaceService init cancellation", () => {
         getSessionDir: mock((id: string) => path.join(tempRoot, id)),
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
+        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
       };
       const workspaceService = new WorkspaceService(
         mockConfig as Config,
@@ -2911,7 +2981,8 @@ describe("WorkspaceService init cancellation", () => {
 
       const result = await workspaceService.remove(workspaceId, true);
       expect(result.success).toBe(true);
-      expect(deleteWorkspaceMock).toHaveBeenCalledWith(projectPath, "ws", true);
+      // trusted defaults to false (no project config), so deleteWorkspace gets (path, name, force, undefined, false)
+      expect(deleteWorkspaceMock).toHaveBeenCalledWith(projectPath, "ws", true, undefined, false);
     } finally {
       createRuntimeSpy.mockRestore();
       await fsPromises.rm(tempRoot, { recursive: true, force: true });
@@ -3157,6 +3228,9 @@ describe("WorkspaceService fork", () => {
       generateStableId: mock(() => newWorkspaceId),
       findWorkspace: mock(() => null),
       getSessionDir: mock(() => "/tmp/test/sessions"),
+      loadConfigOrDefault: mock(() => ({
+        projects: new Map([[sourceProjectPath, { workspaces: [], trusted: true }]]),
+      })),
     };
 
     const workspaceService = new WorkspaceService(

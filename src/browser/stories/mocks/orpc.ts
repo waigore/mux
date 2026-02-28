@@ -1219,6 +1219,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }
         return Promise.resolve({ success: true, data: undefined });
       },
+      setTrust: (input: { projectPath: string; trusted: boolean }) => {
+        const project = projects.get(input.projectPath);
+        if (project) {
+          project.trusted = input.trusted;
+        }
+        return Promise.resolve();
+      },
       secrets: {
         get: (input: { projectPath: string }) =>
           Promise.resolve(projectSecrets.get(input.projectPath) ?? []),
@@ -1478,9 +1485,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       getFileCompletions: (input: { workspaceId: string; query: string; limit?: number }) => {
         // Mock file paths for storybook - simulate typical project structure
         const mockPaths = [
-          "src/browser/components/ChatInput/index.tsx",
-          "src/browser/components/CommandSuggestions.tsx",
-          "src/browser/components/App.tsx",
+          "src/browser/features/ChatInput/index.tsx",
+          "src/browser/features/ChatInput/CommandSuggestions.tsx",
+          "src/browser/App.tsx",
           "src/browser/hooks/usePersistedState.ts",
           "src/browser/contexts/WorkspaceContext.tsx",
           "src/common/utils/atMentions.ts",

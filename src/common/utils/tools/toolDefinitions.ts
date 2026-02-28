@@ -604,6 +604,26 @@ export const System1KeepRangeSchema = z.object({
   reason: z.string().nullish().describe("Optional short reason for keeping this range"),
 });
 
+// -----------------------------------------------------------------------------
+// propose_name (workspace name generation)
+// -----------------------------------------------------------------------------
+
+export const ProposeNameToolArgsSchema = z.object({
+  name: z
+    .string()
+    .regex(/^[a-z0-9-]+$/)
+    .min(2)
+    .max(20)
+    .describe(
+      "Codebase area (1-2 words, max 15 chars): lowercase, hyphens only, e.g. 'sidebar', 'auth', 'config'"
+    ),
+  title: z
+    .string()
+    .min(5)
+    .max(60)
+    .describe("Human-readable title (2-5 words): verb-noun format like 'Fix plan mode'"),
+});
+
 /**
  * Tool definitions: single source of truth
  * Key = tool name, Value = { description, schema }
@@ -900,6 +920,12 @@ export const TOOL_DEFINITIONS = {
       "Do not output a list of open questions; ask them via this tool instead. " +
       "Each question must include 2–4 options; an 'Other' choice is provided automatically.",
     schema: AskUserQuestionToolArgsSchema,
+  },
+  propose_name: {
+    description:
+      "Propose a workspace name and title. You MUST call this tool exactly once with your chosen name and title. " +
+      "Do not emit a text response; call this tool immediately.",
+    schema: ProposeNameToolArgsSchema,
   },
   propose_plan: {
     description:
